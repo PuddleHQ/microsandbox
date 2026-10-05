@@ -1315,6 +1315,9 @@ impl SshSession {
         Ok(())
     }
 
+    /// Opens the guest TCP connection for a `direct-tcpip` channel. A refusal carries the reason
+    /// for the channel-open failure: only an invalid or unsupported request is "administratively
+    /// prohibited"; a guest connect that fails is "connect failed", as in OpenSSH.
     async fn start_tcp_forward(
         &mut self,
         channel: Channel<Msg>,
@@ -1323,7 +1326,7 @@ impl SshSession {
         originator_address: &str,
         originator_port: u32,
         session: &mut Session,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Result<(), ChannelOpenFailure>> {
         if host_to_connect.is_empty() || port_to_connect > u16::MAX as u32 {
             tracing::warn!(
                 host = host_to_connect,
@@ -1332,7 +1335,7 @@ impl SshSession {
                 originator_port,
                 "ssh direct-tcpip rejected invalid destination"
             );
-            return Ok(false);
+            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
         }
 
         let client = self.agent_client().await?;
@@ -1341,7 +1344,7 @@ impl SshSession {
                 negotiated_version = client.negotiated_version(),
                 "ssh direct-tcpip needs a newer sandbox runtime; restart the sandbox to enable forwarding"
             );
-            return Ok(false);
+            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
         }
 
         let channel_id = channel.id();
@@ -1359,7 +1362,7 @@ impl SshSession {
                 port = port_to_connect,
                 "ssh direct-tcpip rejected because agent stream closed before connect reply"
             );
-            return Ok(false);
+            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
         };
 
         let AgentFrame::Control(first) = first else {
@@ -1368,7 +1371,7 @@ impl SshSession {
                 port = port_to_connect,
                 "ssh direct-tcpip received raw data before connect reply"
             );
-            return Ok(false);
+            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
         };
         match first.t {
             MessageType::TcpConnected => {
@@ -1382,7 +1385,7 @@ impl SshSession {
                                 port = port_to_connect,
                                 "ssh direct-tcpip stream closed before bulk acceptance"
                             );
-                            return Ok(false);
+                            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
                         };
                         if accepted_message.t != MessageType::BulkAccepted {
                             tracing::warn!(
@@ -1391,7 +1394,7 @@ impl SshSession {
                                 message_type = accepted_message.t.as_str(),
                                 "ssh direct-tcpip received unexpected bulk negotiation reply"
                             );
-                            return Ok(false);
+                            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
                         }
                         let accepted = accepted_message
                             .payload::<microsandbox_protocol::bulk::BulkAccepted>()?;
@@ -1472,7 +1475,7 @@ impl SshSession {
                         relay,
                     },
                 );
-                Ok(true)
+                Ok(Ok(()))
             }
             MessageType::TcpFailed => {
                 let failed: TcpFailed = first.payload()?;
@@ -1482,7 +1485,7 @@ impl SshSession {
                     error = failed.error,
                     "ssh direct-tcpip rejected because guest TCP connect failed"
                 );
-                Ok(false)
+                Ok(Err(ChannelOpenFailure::ConnectFailed))
             }
             other => {
                 tracing::warn!(
@@ -1491,7 +1494,7 @@ impl SshSession {
                     message_type = other.as_str(),
                     "ssh direct-tcpip rejected unexpected agent reply"
                 );
-                Ok(false)
+                Ok(Err(ChannelOpenFailure::AdministrativelyProhibited))
             }
         }
     }
@@ -1553,7 +1556,7 @@ impl russh::server::Handler for SshSession {
         reply: ChannelOpenHandle,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let accepted = self
+        let result = self
             .start_tcp_forward(
                 channel,
                 host_to_connect,
@@ -1563,12 +1566,9 @@ impl russh::server::Handler for SshSession {
                 session,
             )
             .await?;
-        if accepted {
-            reply.accept().await;
-        } else {
-            reply
-                .reject(ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
+        match result {
+            Ok(()) => reply.accept().await,
+            Err(reason) => reply.reject(reason).await,
         }
         Ok(())
     }

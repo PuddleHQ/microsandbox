@@ -184,6 +184,58 @@ async fn msb_ssh_serve_supports_openssh_local_forwarding() {
     assert_eq!(data, b"tcp-forward-ok");
 }
 
+#[msb_test]
+async fn msb_ssh_serve_reports_refused_forward_as_connect_failed() {
+    if !command_exists("ssh") {
+        eprintln!("skipping OpenSSH forwarding test; ssh is not installed");
+        return;
+    }
+
+    let name = "cli-ssh-direct-tcpip-refused";
+    let sandbox = Sandbox::builder(name)
+        .image("mirror.gcr.io/library/alpine")
+        .cpus(1)
+        .memory(512)
+        .replace()
+        .create()
+        .await
+        .expect("create sandbox");
+
+    let temp = make_temp_dir("msb-ssh-forward-refused");
+    let key_path = temp.join("id_ed25519");
+    let authorized_key = write_test_key(&key_path);
+    command_ok(
+        Command::new(env!("CARGO_BIN_EXE_msb")).args([
+            "ssh",
+            "authorize",
+            "--key",
+            &authorized_key,
+        ]),
+        "authorize OpenSSH test key",
+    )
+    .expect("authorize OpenSSH test key");
+
+    // Nothing listens on this guest port, so the guest connect is refused.
+    let output = openssh_command("ssh", name, &key_path)
+        .args(["-W", "127.0.0.1:18081", "root@msb-direct-tcpip"])
+        .output()
+        .expect("run OpenSSH stdio forward");
+
+    cleanup_sandbox(sandbox, name).await;
+    let _ = std::fs::remove_dir_all(&temp);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "forward should fail: {stderr}");
+    assert!(
+        stderr.contains("open failed: connect failed"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("administratively prohibited"),
+        "stderr={stderr}"
+    );
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -323,6 +375,32 @@ fn spawn_ssh_forward(sandbox_name: &str, key_path: &std::path::Path, local_port:
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn OpenSSH forwarding client")
+}
+
+fn openssh_command(program: &str, sandbox_name: &str, key_path: &std::path::Path) -> Command {
+    let proxy = format!(
+        "{} ssh serve {} --stdio",
+        shell_quote(env!("CARGO_BIN_EXE_msb")),
+        shell_quote(sandbox_name)
+    );
+    let mut command = Command::new(program);
+    command
+        .args([
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            &format!("ProxyCommand={proxy}"),
+            "-i",
+            &key_path.to_string_lossy(),
+        ])
+        .stdin(Stdio::null());
+    command
 }
 
 async fn read_forwarded_bytes(local_port: u16, timeout: Duration) -> Result<Vec<u8>, String> {
