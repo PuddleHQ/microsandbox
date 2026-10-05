@@ -236,6 +236,70 @@ async fn msb_ssh_serve_reports_refused_forward_as_connect_failed() {
     );
 }
 
+#[msb_test]
+async fn msb_ssh_serve_reports_sftp_exit_status_to_scp() {
+    if !command_exists("scp") {
+        eprintln!("skipping OpenSSH scp test; scp is not installed");
+        return;
+    }
+
+    let name = "cli-ssh-scp-status";
+    let sandbox = Sandbox::builder(name)
+        .image("mirror.gcr.io/library/alpine")
+        .cpus(1)
+        .memory(512)
+        .replace()
+        .create()
+        .await
+        .expect("create sandbox");
+
+    let temp = make_temp_dir("msb-ssh-scp");
+    let key_path = temp.join("id_ed25519");
+    let authorized_key = write_test_key(&key_path);
+    command_ok(
+        Command::new(env!("CARGO_BIN_EXE_msb")).args([
+            "ssh",
+            "authorize",
+            "--key",
+            &authorized_key,
+        ]),
+        "authorize OpenSSH test key",
+    )
+    .expect("authorize OpenSSH test key");
+
+    let upload_path = temp.join("upload.txt");
+    let download_path = temp.join("download.txt");
+    std::fs::write(&upload_path, b"scp-ok").expect("write scp payload");
+
+    // `-s` forces the SFTP protocol, the default since OpenSSH 9.0.
+    let upload = openssh_command("scp", name, &key_path)
+        .arg("-s")
+        .arg(&upload_path)
+        .arg("root@msb-scp:/tmp/scp-payload.txt")
+        .output()
+        .expect("run scp upload");
+    let download = openssh_command("scp", name, &key_path)
+        .arg("-s")
+        .arg("root@msb-scp:/tmp/scp-payload.txt")
+        .arg(&download_path)
+        .output()
+        .expect("run scp download");
+    let downloaded = std::fs::read(&download_path);
+
+    cleanup_sandbox(sandbox, name).await;
+    let _ = std::fs::remove_dir_all(&temp);
+
+    for (direction, output) in [("upload", &upload), ("download", &download)] {
+        assert!(
+            output.status.success(),
+            "scp {direction} failed: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(downloaded.expect("read downloaded file"), b"scp-ok");
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------

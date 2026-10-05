@@ -1719,10 +1719,20 @@ impl russh::server::Handler for SshSession {
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         // The channel stream observes EOF independently of the callback path.
         if matches!(self.channels.get(&channel), Some(ChannelState::Tcp { .. })) {
+            return Ok(());
+        }
+
+        // The SFTP server stops at client EOF, like OpenSSH's sftp-server, and dropping its
+        // stream closes the channel. Report a clean exit first: scp's exit code is the status
+        // of its ssh child, which is 255 when the channel closes without one. Russh hands the
+        // EOF to the stream before this callback and sends that close only after it returns,
+        // so the status always goes out before the close.
+        if matches!(self.channels.get(&channel), Some(ChannelState::Sftp)) {
+            session.exit_status_request(channel, 0)?;
             return Ok(());
         }
 
