@@ -6,7 +6,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use msb_krun::backends::vsock::{
     VsockConnectRequest, VsockConnectState, VsockNotifier, VsockPortBackend, VsockShutdown,
@@ -33,6 +33,9 @@ const MAX_BUFFERED_BYTES: usize = 8 * 1024 * 1024;
 const IO_CHUNK_SIZE: usize = 64 * 1024;
 const WORKER_WAIT: Duration = Duration::from_millis(10);
 const PIPE_BUSY_WAIT_MS: u32 = 50;
+/// How long a closed guest stream may keep writing its queued bytes to a pipe
+/// server that has stopped reading.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -46,8 +49,8 @@ pub struct WindowsNamedPipePortBackend {
 
 struct WindowsNamedPipeBackend {
     shared: Arc<SharedState>,
-    worker: JoinHandle<()>,
-    _lease: PeerLease,
+    worker: Option<JoinHandle<()>>,
+    lease: Option<PeerLease>,
 }
 
 struct SharedState {
@@ -62,6 +65,8 @@ struct PipeState {
     outgoing: VecDeque<u8>,
     read_shutdown: bool,
     write_shutdown: bool,
+    /// The guest closed the stream: write what is queued, then close the pipe.
+    closing: bool,
     terminate: bool,
 }
 
@@ -170,6 +175,7 @@ impl VsockPortBackend for WindowsNamedPipePortBackend {
                 outgoing: VecDeque::new(),
                 read_shutdown: false,
                 write_shutdown: false,
+                closing: false,
                 terminate: false,
             }),
             wake_worker: Condvar::new(),
@@ -183,8 +189,8 @@ impl VsockPortBackend for WindowsNamedPipePortBackend {
 
         Ok(Box::new(WindowsNamedPipeBackend {
             shared,
-            worker,
-            _lease: lease,
+            worker: Some(worker),
+            lease: Some(lease),
         }))
     }
 }
@@ -245,34 +251,70 @@ impl VsockStreamBackend for WindowsNamedPipeBackend {
     }
 
     fn shutdown(&self, how: VsockShutdown) -> io::Result<()> {
-        let terminate = how == VsockShutdown::Both;
         let mut state = self.shared.state.lock().unwrap();
         match how {
             VsockShutdown::Read => state.read_shutdown = true,
             VsockShutdown::Write => state.write_shutdown = true,
             VsockShutdown::Both => {
+                // The guest sent its data before it closed. Bytes still in
+                // `outgoing` are part of that data, so the worker writes them
+                // before it closes the pipe instead of dropping them.
                 state.read_shutdown = true;
                 state.write_shutdown = true;
-                state.terminate = true;
+                state.closing = true;
             }
         }
         drop(state);
         self.shared.wake_worker.notify_one();
-        if terminate {
-            cancel_worker_io(&self.worker);
-        }
         Ok(())
     }
 }
 
 impl Drop for WindowsNamedPipeBackend {
     fn drop(&mut self) {
-        self.shared.state.lock().unwrap().terminate = true;
+        let drain = {
+            let mut state = self.shared.state.lock().unwrap();
+            let drain = state.closing
+                && !state.outgoing.is_empty()
+                && matches!(state.connection, ConnectionState::Connected);
+            if !drain {
+                state.terminate = true;
+            }
+            drain
+        };
         self.shared.wake_worker.notify_one();
-        // A named-pipe server can stop reading indefinitely. Cancel any
-        // synchronous ReadFile/WriteFile owned by this worker so dropping a
-        // guest connection cannot strand a thread outside the peer limit.
-        cancel_worker_io(&self.worker);
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        if !drain {
+            // A named-pipe server can stop reading indefinitely. Cancel any
+            // synchronous ReadFile/WriteFile owned by this worker so dropping a
+            // guest connection cannot strand a thread outside the peer limit.
+            cancel_worker_io(&worker);
+            return;
+        }
+
+        // A closed guest stream still has bytes queued. Let the worker finish
+        // writing them, but not forever: cancel its I/O after a deadline. The
+        // peer slot stays taken until the worker is done.
+        let shared = Arc::clone(&self.shared);
+        let lease = self.lease.take();
+        // Without a watchdog thread the worker still drains; it only loses
+        // its deadline.
+        let _ = std::thread::Builder::new()
+            .name("vsock named pipe close".to_string())
+            .spawn(move || {
+                let deadline = Instant::now() + CLOSE_DRAIN_TIMEOUT;
+                while !worker.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(WORKER_WAIT);
+                }
+                if !worker.is_finished() {
+                    shared.state.lock().unwrap().terminate = true;
+                    shared.wake_worker.notify_one();
+                    cancel_worker_io(&worker);
+                }
+                drop(lease);
+            });
     }
 }
 
@@ -379,7 +421,7 @@ fn named_pipe_worker(path: PathBuf, shared: Arc<SharedState>) {
         let mut progress = false;
         let outgoing = {
             let mut state = shared.state.lock().unwrap();
-            if state.terminate {
+            if state.terminate || (state.closing && state.outgoing.is_empty()) {
                 return;
             }
             let count = state.outgoing.len().min(IO_CHUNK_SIZE);
@@ -497,6 +539,80 @@ mod tests {
         assert!(validate_named_pipe_path(Path::new(r"\\server\pipe\api")).is_err());
         assert!(validate_named_pipe_path(Path::new(r"\\.\pipe\..\api")).is_err());
         assert!(validate_named_pipe_path(Path::new(r"C:\api")).is_err());
+    }
+
+    #[test]
+    fn guest_close_keeps_bytes_the_pipe_server_has_not_read_yet() {
+        const LEN: usize = 256 * 1024;
+        let name = format!(r"\\.\pipe\msb-vsock-close-test-{}", std::process::id());
+        let wide = wide_null(OsStr::new(&name));
+        // A 4 KiB pipe buffer and a server that reads late: most of the
+        // stream is still queued in the backend when the guest closes.
+        let server = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(server, INVALID_HANDLE_VALUE);
+        let server = PipeHandle(server);
+        let host = std::thread::spawn(move || {
+            let connected = unsafe { ConnectNamedPipe(server.raw(), std::ptr::null_mut()) };
+            if connected == 0 {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(ERROR_PIPE_CONNECTED as i32)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            let mut total = 0;
+            let mut buf = [0_u8; 8192];
+            loop {
+                let mut read = 0;
+                let ok = unsafe {
+                    ReadFile(
+                        server.raw(),
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                        &mut read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || read == 0 {
+                    break total;
+                }
+                total += read as usize;
+            }
+        });
+
+        let service = WindowsNamedPipePortBackend::new(&name).unwrap();
+        let endpoint = service
+            .connect(
+                VsockConnectRequest {
+                    guest_cid: 3,
+                    guest_port: 4001,
+                    host_port: 5000,
+                },
+                VsockNotifier::new().unwrap(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while endpoint.connect_state().unwrap() != VsockConnectState::Connected {
+            assert!(Instant::now() < deadline, "named-pipe connect timed out");
+            std::thread::yield_now();
+        }
+        assert_eq!(endpoint.write(&vec![7_u8; LEN]).unwrap(), LEN);
+
+        // What libkrun does when the guest closes: SHUTDOWN, then drop.
+        endpoint.shutdown(VsockShutdown::Both).unwrap();
+        drop(endpoint);
+        assert_eq!(host.join().unwrap(), LEN);
     }
 
     #[test]
