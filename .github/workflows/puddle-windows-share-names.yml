@@ -1,0 +1,48 @@
+# puddle fork: Windows share names (puddle T-886). Fork-only file.
+#
+# Runs the Windows passthrough tests of microsandbox-filesystem on a hosted Windows runner: the
+# guest cannot reach a device (`CON`, `NUL`, `COM1`), a trailing-dot name or an 8.3 short name,
+# and the mount root is resolved as a `\\?\` path. puddle-release.yml runs the same tests in
+# its `test-windows` job.
+#
+#   gh workflow run puddle-windows-share-names.yml -R PuddleHQ/microsandbox --ref <branch>
+name: puddle windows share names
+
+on:
+  push:
+    branches:
+      - puddle
+      - task/t886-**
+    paths:
+      - .github/workflows/puddle-windows-share-names.yml
+      - crates/filesystem/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-share-names:
+    name: Windows passthrough share-name tests (windows-2025)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-windows-share-names
+
+      - name: Show whether the volume makes 8.3 short names
+        shell: pwsh
+        run: fsutil 8dot3name query 'C:'
+
+      - name: microsandbox-filesystem Windows passthrough tests
+        shell: pwsh
+        run: |
+          cargo test --locked --no-default-features -p microsandbox-filesystem --lib backends::passthroughfs::windows -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-filesystem Windows tests failed" }

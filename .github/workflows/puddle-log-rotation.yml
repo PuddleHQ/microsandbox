@@ -1,0 +1,50 @@
+# puddle fork: runtime.log rotation tests on hosted runners. Fork-only file. Windows is the point:
+# the failed-rotation tests hold the log open without FILE_SHARE_DELETE (what an editor, a log
+# tailer or antivirus does) and check that the log thread reports once, keeps writing, loses no
+# older log and rotates once the file is free. Linux runs the same tests with a read-only log
+# directory as the obstacle.
+name: puddle log rotation
+
+on:
+  push:
+    branches: ["log-rotation/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  rotation:
+    name: Rotation tests ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          shared-key: puddle-log-rotation-${{ matrix.os }}
+          cache-on-failure: true
+      - name: Log rotation tests
+        shell: bash
+        run: |
+          cargo test --locked -p microsandbox-runtime --lib -- --nocapture \
+            log_thread stderr_capture runner::logging 2>&1 | tee test.log
+          test "${PIPESTATUS[0]}" -eq 0
+      - name: The obstacle really blocked the rotation (no test was skipped)
+        shell: bash
+        run: |
+          if grep -q "cannot block renames here" test.log; then
+            echo "::error::a failed-rotation test was skipped"; exit 1
+          fi
+          grep -E "^test .*(failed_rotation|reports_a_failed_rotation)" test.log
