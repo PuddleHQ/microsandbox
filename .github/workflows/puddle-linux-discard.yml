@@ -1,0 +1,196 @@
+# puddle fork: a guest `fstrim` on a disk volume returns the freed space to the host image, on a hosted
+# Linux runner with KVM (puddle T-365). Fork-only file; puddle-release.yml calls it as a gate (its `ref`:
+# the tag; the stock control only reports).
+#
+# Builds agentd (musl) and msb for Linux from this commit, boots a debian sandbox with a 2 GiB disk
+# volume, writes 1 GiB, deletes it, runs `fstrim /data` and stops, printing the image's allocated size on
+# the host after each step (tests/puddle/linux-discard.sh). The fork must advertise discard under msb's
+# default bounded writeback, `fstrim` must exit 0 and the image must shrink under 300 MiB. The same cases
+# run against upstream's stock release as a control: it refuses ("the discard operation is not
+# supported") and keeps ~1 GiB, so a pass of the fork run is not vacuous.
+#
+#   gh workflow run puddle-linux-discard.yml -R TijsVK/microsandbox --ref <branch> [-f stock_tag=v0.7.7]
+name: puddle linux discard
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit or tag to test (empty: the ref of the run; puddle release passes its tag)"
+        required: false
+        default: ""
+        type: string
+      stock_tag:
+        description: "Upstream release for the control run (empty: no control)"
+        required: false
+        default: v0.7.7
+        type: string
+  workflow_dispatch:
+    inputs:
+      stock_tag:
+        description: "Upstream release for the control run (empty: no control)"
+        required: false
+        default: v0.7.7
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: superradcompany/microsandbox
+
+jobs:
+  build:
+    name: Build agentd + msb (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Upstream release of this fork version
+        id: up
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "tag=v${version%%-puddle.*}" >> "$GITHUB_OUTPUT"
+          echo "fork version $version, upstream v${version%%-puddle.*}"
+
+      - name: libkrunfw from upstream ${{ steps.up.outputs.tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$UPSTREAM_REPO" -D dl -p checksums.sha256 -p libkrunfw-linux-x86_64.so
+          bash .github/puddle/verify-asset.sh dl/checksums.sha256 dl/libkrunfw-linux-x86_64.so libkrunfw-linux-x86_64.so
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          shared-key: puddle-msb-linux
+
+      # The guest agent from this commit's source: its per-client limit must match the msb that embeds it.
+      - name: Build agentd, then msb with it embedded
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -y -q libcap-ng-dev musl-tools
+          cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target-dir target-agentd \
+            --target x86_64-unknown-linux-musl
+          mkdir -p embed rt
+          cp target-agentd/x86_64-unknown-linux-musl/release/agentd embed/agentd
+          MSB_EMBED_ARTIFACTS_DIR="$PWD/embed" cargo build --locked --release --no-default-features \
+            --features embed-binaries,net,ssh -p microsandbox-cli
+          fw=$(sed -n 's/.*LIBKRUNFW_VERSION: &str = "\(.*\)";/\1/p' crates/utils/lib/lib.rs)
+          cp target/release/msb rt/msb
+          cp dl/libkrunfw-linux-x86_64.so "rt/libkrunfw.so.$fw"
+          ./rt/msb --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-linux
+          path: rt/
+          compression-level: 1
+
+  discard:
+    name: linux discard (${{ matrix.runtime }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [fork, stock]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+
+      - name: KVM
+        id: kvm
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_STOCK: ${{ inputs.stock_tag }}
+          RUNTIME: ${{ matrix.runtime }}
+        run: |
+          set -euo pipefail
+          # A push runs the control against v0.7.7; a dispatch with an empty stock_tag skips it.
+          stock=v0.7.7
+          [ "$EVENT" != workflow_dispatch ] || stock=$INPUT_STOCK
+          echo "stock_tag=$stock" >> "$GITHUB_OUTPUT"
+          if [ "$RUNTIME" = stock ] && [ -z "$stock" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"; echo "no control run requested"; exit 0
+          fi
+          [ -e /dev/kvm ] || { echo "::error::/dev/kvm is missing on this runner (infrastructure)"; exit 1; }
+          # Hosted runners ship /dev/kvm root-only; open it to the runner user.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ matrix.runtime == 'fork' }}
+        with:
+          name: msb-linux
+          path: rt
+
+      - name: Stock runtime ${{ steps.kvm.outputs.stock_tag }}
+        if: ${{ matrix.runtime == 'stock' && steps.kvm.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.kvm.outputs.stock_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$UPSTREAM_REPO" -D dl \
+            -p checksums.sha256 -p msb-linux-x86_64 -p libkrunfw-linux-x86_64.so
+          bash .github/puddle/verify-asset.sh dl/checksums.sha256 dl/msb-linux-x86_64 msb-linux-x86_64
+          bash .github/puddle/verify-asset.sh dl/checksums.sha256 dl/libkrunfw-linux-x86_64.so libkrunfw-linux-x86_64.so
+          # msb looks for libkrunfw.so.<LIBKRUNFW_VERSION of its source> beside itself.
+          fw=$(gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/$UPSTREAM_REPO/contents/crates/utils/lib/lib.rs?ref=$TAG" \
+            | sed -n 's/.*LIBKRUNFW_VERSION: &str = "\(.*\)";/\1/p')
+          [ -n "$fw" ] || { echo "::error::no LIBKRUNFW_VERSION in $TAG"; exit 1; }
+          mkdir -p rt
+          cp dl/msb-linux-x86_64 rt/msb
+          cp dl/libkrunfw-linux-x86_64.so "rt/libkrunfw.so.$fw"
+          ls -l rt
+
+      - name: Run the cases
+        if: ${{ steps.kvm.outputs.run == 'true' }}
+        run: |
+          # Not -e (the shell's default here): the exit code is judged below.
+          set +e -uo pipefail
+          chmod +x rt/msb
+          LINUX_DISCARD_NAME=disc-${{ matrix.runtime }} bash tests/puddle/linux-discard.sh rt "$RUNNER_TEMP/w" 2>&1 \
+            | tee "$RUNNER_TEMP/discard.log"
+          code=${PIPESTATUS[0]}
+          echo "linux-discard.sh exit $code"
+          if [ "${{ matrix.runtime }}" = stock ]; then
+            # The control reports (it must fail); only a setup failure fails it.
+            [ "$code" -ne 2 ] || exit 1
+            exit 0
+          fi
+          exit "$code"
+
+      - name: Keep logs
+        if: ${{ !cancelled() && steps.kvm.outputs.run == 'true' }}
+        run: |
+          mkdir -p keep
+          cp "$RUNNER_TEMP/discard.log" "$RUNNER_TEMP"/w/*.log keep/ 2>/dev/null || true
+          find "$RUNNER_TEMP/w/home" -path '*/logs/*' -name '*.log' -exec cp --parents {} keep/ \; 2>/dev/null || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() && steps.kvm.outputs.run == 'true' }}
+        with:
+          name: linux-discard-${{ matrix.runtime }}
+          path: keep/

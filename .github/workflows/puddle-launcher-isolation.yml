@@ -1,0 +1,72 @@
+# puddle fork: the sandbox process must not share its creator's console (Windows), and must die when
+# the creator is killed. Fork-only file. Runs the launcher_isolation tests of the SDK
+# (sdk/rust/lib/runtime/launcher_isolation.rs) on hosted windows-2025 runners: a plain child shares
+# the test's console and the sandbox process does not, and TerminateProcess on the creator takes the
+# sandbox process with it. The Unix half (own session and process group) runs in puddle release's
+# Linux `msb lib tests`. puddle-release.yml also calls this file as a gate (`ref`: its tag).
+name: puddle launcher isolation
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit or tag to test (empty: the ref of the run; puddle release passes its tag)"
+        required: false
+        default: ""
+        type: string
+  push:
+    branches: [puddle, "task/t153*"]
+    paths:
+      - sdk/rust/lib/runtime/**
+      - .github/workflows/puddle-launcher-isolation.yml
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Test runs in a row (each must pass)"
+        required: false
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    name: Launcher isolation (windows-2025)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          shared-key: puddle-launcher-isolation
+          cache-on-failure: true
+      - name: Build the test binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo test --locked -p microsandbox --lib --no-default-features --features local,net --no-run
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+      - name: Tests
+        shell: pwsh
+        env:
+          REPEAT: ${{ inputs.repeat || '3' }}
+        run: |
+          $fail = 0
+          for ($i = 1; $i -le [int]$env:REPEAT; $i++) {
+            $out = cargo test --locked -p microsandbox --lib --no-default-features --features local,net launcher_isolation -- --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $out | Select-String "^test |test result|panicked" | ForEach-Object { $_.Line }
+            if ($code -ne 0) { $fail++; Write-Host "::group::run $i full output"; $out | Write-Host; Write-Host "::endgroup::" }
+          }
+          "$fail of $env:REPEAT runs failed"
+          if ($fail -gt 0) { throw "$fail failed runs" }

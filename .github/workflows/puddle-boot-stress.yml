@@ -1,0 +1,168 @@
+# puddle fork: boot stress on hosted windows-2025 runners, to catch rare early VM exits with their
+# evidence (puddle T-164). Fork-only file, dispatch only; it gates nothing.
+#
+# Each shard runs tests/puddle/repros.ps1 -Case boot (rounds x concurrent creates of one guest shape)
+# against a published release. Every failed create keeps its logs\ directory (debug runtime.log with
+# the VMM trace, kernel.log, boot-error.json) and the create's --debug output in the artifact
+# boot-stress-<shard>, and prints a "boot-evidence" line that tells the T-096 timer-check panic
+# (rtc-c-polls=90, empty kernel.log) from other early exits.
+#
+#   gh workflow run puddle-boot-stress.yml -R TijsVK/microsandbox -f release_tag=v0.7.7-puddle.7 \
+#     -f shards='[1,2,3,4,5,6,7,8,9,10]' -f rounds=25 -f par=8 -f cpus=2 -f memory=1024
+name: puddle boot stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_repo:
+        description: "Repo whose release to test"
+        required: true
+        default: TijsVK/microsandbox
+        type: string
+      release_tag:
+        description: "Release tag, e.g. v0.7.7-puddle.7"
+        required: true
+        type: string
+      shards:
+        description: "JSON array of shard ids, one windows-2025 job each"
+        required: true
+        default: "[1,2,3,4]"
+        type: string
+      rounds:
+        description: "Rounds per shard"
+        required: true
+        default: "20"
+        type: string
+      par:
+        description: "Concurrent creates per round"
+        required: true
+        default: "6"
+        type: string
+      cpus:
+        description: "vCPUs per guest"
+        required: true
+        default: "2"
+        type: string
+      memory:
+        description: "MiB per guest (0 = msb default)"
+        required: true
+        default: "0"
+        type: string
+      image:
+        description: "Guest image, or probe for puddle doctor's test boot (fresh bind root, msb run)"
+        required: true
+        default: alpine
+        type: string
+      cmdline:
+        description: "Extra guest kernel command line (MSB_KRUN_KERNEL_CMDLINE), e.g. loglevel=8"
+        required: false
+        default: ""
+        type: string
+      agentd_tag:
+        description: "Release on this repo whose agentd-x86_64 asset replaces the embedded agentd (diagnostics)"
+        required: false
+        default: ""
+        type: string
+      keep_if_klog:
+        description: "Regex: also keep and count good boots whose kernel.log matches"
+        required: false
+        default: ""
+        type: string
+      keep_good:
+        description: "Good boots per shard whose logs are kept for comparison"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: Boot stress ${{ matrix.shard }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+
+      - name: msb.exe + libkrunfw from release ${{ inputs.release_repo }}@${{ inputs.release_tag }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ inputs.release_repo }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$REPO" -D dl \
+            -p checksums.sha256 -p msb-windows-x86_64.exe -p libkrunfw-windows-x86_64.dll
+          v=.github/puddle/verify-asset.sh
+          bash "$v" dl/checksums.sha256 dl/msb-windows-x86_64.exe msb-windows-x86_64.exe
+          bash "$v" dl/checksums.sha256 dl/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+
+      - name: Diagnostic agentd from ${{ inputs.agentd_tag }}
+        if: inputs.agentd_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.agentd_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D agentd-dl -p agentd-x86_64
+          sha256sum agentd-dl/agentd-x86_64
+
+      - name: Install layout
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path runtime | Out-Null
+          Copy-Item dl\msb-windows-x86_64.exe runtime\msb.exe -Force
+          Copy-Item dl\libkrunfw-windows-x86_64.dll runtime\libkrunfw.dll -Force
+          & runtime\msb.exe --version
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          "host: $($cs.NumberOfLogicalProcessors) logical CPUs, $([int]($cs.TotalPhysicalMemory / 1GB)) GB, $($cpu.Name)"
+
+      - name: Boot stress (shard ${{ matrix.shard }})
+        shell: pwsh
+        env:
+          ROUNDS: ${{ inputs.rounds }}
+          PAR: ${{ inputs.par }}
+          CPUS: ${{ inputs.cpus }}
+          MEMORY: ${{ inputs.memory }}
+          IMAGE: ${{ inputs.image }}
+          SHARD: ${{ matrix.shard }}
+          CMDLINE: ${{ inputs.cmdline }}
+          KEEP_GOOD: ${{ inputs.keep_good }}
+          KEEP_IF_KLOG: ${{ inputs.keep_if_klog }}
+        run: |
+          $w = Join-Path $env:RUNNER_TEMP 'r'
+          $extra = @()
+          # An empty argument would reach powershell -File as a missing value.
+          if ($env:CMDLINE -ne '') { $extra = @('-KernelCmdline', $env:CMDLINE) }
+          if ($env:KEEP_IF_KLOG -ne '') { $extra += @('-KeepIfKernelLog', $env:KEEP_IF_KLOG) }
+          if (Test-Path agentd-dl\agentd-x86_64) { $extra += @('-AgentdPath', "$PWD\agentd-dl\agentd-x86_64") }
+          ./tests/puddle/run-outside-job.ps1 -Script tests/puddle/repros.ps1 -Log "$w-log/repros.log" -TimeoutSec 3300 -- `
+            -Msb "$PWD\runtime\msb.exe" -Libkrunfw "$PWD\runtime\libkrunfw.dll" -Case boot -Work $w `
+            -Prefix "s$env:SHARD" -BootRounds $env:ROUNDS -BootPar $env:PAR -BootCpus $env:CPUS `
+            -BootMemory $env:MEMORY -BootImage $env:IMAGE -KeepGoodBoots $env:KEEP_GOOD @extra
+          $code = $LASTEXITCODE
+          $sum = Select-String -Path "$w-log/repros.log" -Pattern '^boot-summary:|boot-evidence' | ForEach-Object { $_.Line.Trim() }
+          "### shard $env:SHARD" >> $env:GITHUB_STEP_SUMMARY
+          $sum | ForEach-Object { "- ``$_``" >> $env:GITHUB_STEP_SUMMARY }
+          exit $code
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: boot-stress-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/r-log/
+            ${{ runner.temp }}/r/logs/
+          if-no-files-found: ignore

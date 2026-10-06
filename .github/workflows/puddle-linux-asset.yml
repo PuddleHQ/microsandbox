@@ -1,0 +1,106 @@
+# puddle fork: add the Linux msb to an existing fork release (fork-only file).
+#
+# New tags get msb-linux-x86_64 and libkrunfw-linux-x86_64.so from puddle-release.yml (build-linux).
+# This workflow backfills a tag released before that job existed: it builds the Linux msb from the
+# tag's source, embedding the release's own agentd-x86_64 (checked against the release's
+# checksums.sha256, so the guest agent is the one the Windows msb.exe embeds), checks version,
+# linkage and runtime discovery, and adds both Linux files to the release. The release's
+# checksums.sha256 gains two lines; no other asset is touched. Running it again for a tag that has
+# the files does nothing.
+name: puddle linux asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing fork release tag, e.g. v0.7.8-puddle.6"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: puddle-linux-asset-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  linux-asset:
+    name: Build msb (Linux) and add it to the release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Check the tag and the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-puddle\.[1-9][0-9]*$ ]] || { echo "::error::$TAG is not a v<MAJOR.MINOR.PATCH>-puddle.<N> tag"; exit 1; }
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | tee assets.txt
+          grep -qx agentd-x86_64 assets.txt || { echo "::error::release $TAG has no agentd-x86_64"; exit 1; }
+          if grep -qx msb-linux-x86_64 assets.txt; then echo "release $TAG already has msb-linux-x86_64; nothing to do"; echo "SKIP=true" >> "$GITHUB_ENV"; fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          ref: ${{ inputs.tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: env.SKIP != 'true'
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        if: env.SKIP != 'true'
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-release-linux
+
+      - name: Install build deps
+        if: env.SKIP != 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
+      - name: Release agentd and upstream libkrunfw, verified
+        if: env.SKIP != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          up_tag=${TAG%-puddle.*}
+          mkdir -p rel upstream
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D rel -p checksums.sha256 -p agentd-x86_64
+          gh release download "$up_tag" -R superradcompany/microsandbox -D upstream -p checksums.sha256 -p libkrunfw-linux-x86_64.so
+          v=_puddle/.github/puddle/verify-asset.sh
+          bash "$v" rel/checksums.sha256 rel/agentd-x86_64 agentd-x86_64
+          bash "$v" upstream/checksums.sha256 upstream/libkrunfw-linux-x86_64.so libkrunfw-linux-x86_64.so
+
+      - name: Build msb, check version, linkage and runtime discovery
+        if: env.SKIP != 'true'
+        run: bash _puddle/.github/puddle/build-linux-msb.sh rel/agentd-x86_64 upstream/libkrunfw-linux-x86_64.so "${TAG#v}" out
+
+      - name: Add to the release
+        if: env.SKIP != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp upstream/libkrunfw-linux-x86_64.so out/
+          sums=rel/checksums.sha256
+          grep -v -E ' \*?(msb-linux-x86_64|libkrunfw-linux-x86_64\.so)$' "$sums" > out/checksums.sha256 || true
+          (cd out && sha256sum msb-linux-x86_64 libkrunfw-linux-x86_64.so >> checksums.sha256 && cat checksums.sha256)
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" out/msb-linux-x86_64 out/libkrunfw-linux-x86_64.so
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber out/checksums.sha256

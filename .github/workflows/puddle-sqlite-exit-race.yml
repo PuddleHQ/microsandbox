@@ -1,0 +1,163 @@
+# puddle fork: opening msb's SQLite catalog while another msb process that used it is exiting,
+# on hosted windows-2025 runners. Fork-only file. Runs crates/db/tests/open_after_process_exit.rs
+# (short-lived writer processes against a parent that keeps opening the catalog) in a loop.
+# Stress for the connect retry in crates/db/lib/pool.rs. None of these jobs failed without it:
+# the failure (code 1546 at connect) has only been seen in puddle's own vm-windows runs.
+name: puddle sqlite exit race
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Rounds per test run (each round: 3 writer processes)"
+        required: false
+        default: "30"
+        type: string
+      release_tag:
+        description: "Release of this repo whose msb.exe the cli job tests"
+        required: false
+        default: "v0.7.7-puddle.13"
+        type: string
+      cli_rounds:
+        description: "Rounds of the cli job"
+        required: false
+        default: "150"
+        type: string
+      runtime_rounds:
+        description: "Boot rounds of the runtimes job (4 sandboxes each)"
+        required: false
+        default: "60"
+        type: string
+      runs:
+        description: "Test runs per shard"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  race:
+    name: Exit race ${{ matrix.shard }}
+    runs-on: windows-2025
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          shared-key: puddle-sqlite-exit-race
+          cache-on-failure: true
+      - name: Build the test binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo test --locked -p microsandbox-db --test open_after_process_exit --no-run
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+      - name: Loop
+        shell: pwsh
+        env:
+          MSB_DB_EXIT_ROUNDS: ${{ inputs.rounds || '30' }}
+          RUNS: ${{ inputs.runs || '1' }}
+        run: |
+          $fail = 0
+          for ($i = 1; $i -le [int]$env:RUNS; $i++) {
+            $out = cargo test --locked -p microsandbox-db --test open_after_process_exit -- --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $out | Select-String "^mode |^  (round|open)|test result" | ForEach-Object { $_.Line }
+            if ($code -ne 0) { $fail++; Write-Host "::group::run $i full output"; $out | Write-Host; Write-Host "::endgroup::" }
+          }
+          "shard ${{ matrix.shard }}: $fail of $env:RUNS runs failed"
+          if ($fail -gt 0) { throw "$fail failed runs" }
+
+  # The real thing: msb.exe from a published release, many `msb sandbox ls` at once on one home.
+  # Each opens the catalog and exits with its pool open while others open it.
+  cli:
+    name: msb.exe opens ${{ matrix.par }} at once
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        par: [4, 12]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+      - name: msb.exe from the release ${{ inputs.release_tag || 'v0.7.7-puddle.13' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || 'v0.7.7-puddle.13' }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dl -p checksums.sha256 -p msb-windows-x86_64.exe
+          bash .github/puddle/verify-asset.sh dl/checksums.sha256 dl/msb-windows-x86_64.exe msb-windows-x86_64.exe
+      - name: Open the catalog from many processes
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/puddle/catalog-exit.ps1 -Msb dl\msb-windows-x86_64.exe -Rounds ${{ inputs.cli_rounds || '150' }} -Par ${{ matrix.par }}
+          if ($LASTEXITCODE -ne 0) { throw "catalog open failed" }
+
+  # Real sandbox runtimes: msb.exe boots and stops alpine sandboxes while the db test binary
+  # opens the catalog in a loop (the failure puddle's vm-windows runs saw: connect to msb.db,
+  # code 1546, disk I/O error, right after a previous test's sandbox exited).
+  runtimes:
+    name: Open while sandbox runtimes exit ${{ matrix.shard }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          shared-key: puddle-sqlite-exit-race
+          cache-on-failure: true
+      - name: Build the opener
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $json = cargo test --locked -p microsandbox-db --test open_after_process_exit --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+          $exe = $json | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+            Where-Object { $_ -and $_.executable -and $_.target.name -eq 'open_after_process_exit' } | Select-Object -Last 1
+          New-Item -ItemType Directory -Force -Path opener | Out-Null
+          Copy-Item $exe.executable opener\opener.exe
+      - name: msb.exe + libkrunfw from the release ${{ inputs.release_tag || 'v0.7.7-puddle.13' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || 'v0.7.7-puddle.13' }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dl \
+            -p checksums.sha256 -p msb-windows-x86_64.exe -p libkrunfw-windows-x86_64.dll
+          v=.github/puddle/verify-asset.sh
+          bash "$v" dl/checksums.sha256 dl/msb-windows-x86_64.exe msb-windows-x86_64.exe
+          bash "$v" dl/checksums.sha256 dl/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+      - name: Boot and stop sandboxes while the catalog is opened
+        shell: pwsh
+        run: |
+          $w = Join-Path $env:RUNNER_TEMP 'co'
+          ./tests/puddle/run-outside-job.ps1 -Script tests/puddle/catalog-open.ps1 -Log "$w-log/catalog-open.log" -TimeoutSec 2400 -- `
+            -Msb "$PWD\dl\msb-windows-x86_64.exe" -Libkrunfw "$PWD\dl\libkrunfw-windows-x86_64.dll" `
+            -Opener "$PWD\opener\opener.exe" -Rounds ${{ inputs.runtime_rounds || '60' }} -Par 4 -Work $w
+          exit $LASTEXITCODE
