@@ -123,6 +123,9 @@ pub struct RegistryConfig {
     pub ca_certs: Vec<Vec<u8>>,
     /// Registry hosts that use plain HTTP.
     pub insecure_registries: Vec<String>,
+    /// Proxy for registry requests, set with `LocalBackendBuilder::registry_proxy`. `None`
+    /// leaves the process environment in charge.
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +400,7 @@ impl RegistrySettings {
             auth,
             ca_certs,
             insecure_registries,
+            proxy: None,
         })
     }
 }
