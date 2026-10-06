@@ -2755,6 +2755,109 @@ mod tests {
             .unwrap();
     }
 
+    /// A proxy that records each request head it receives and then refuses the request, so a
+    /// pull fails fast. Returns its address and the shared list of heads.
+    async fn recording_proxy() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = heads.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte).await {
+                            Ok(1) => head.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    seen.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&head).into_owned());
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (addr, heads)
+    }
+
+    #[tokio::test]
+    async fn test_registry_builder_proxy_carries_https_and_http_registries() {
+        let (addr, heads) = recording_proxy().await;
+        // base64("puddle:tok3n")
+        let credentials = "Basic cHVkZGxlOnRvazNu";
+        let proxy = format!("http://puddle:tok3n@{addr}");
+
+        for (reference, insecure) in [
+            ("secure.invalid/ns/app:1", vec![]),
+            (
+                "plain.invalid:5000/ns/app:1",
+                vec!["plain.invalid:5000".into()],
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let cache = GlobalCache::new(temp.path()).unwrap();
+            let registry = super::Registry::builder(Platform::default(), cache)
+                .add_insecure_registries(insecure)
+                .proxy(proxy.clone())
+                .build()
+                .unwrap();
+            let reference: oci_client::Reference = reference.parse().unwrap();
+            let options = crate::PullOptions::default();
+            let pull = registry.pull(&reference, &options);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(20), pull).await;
+            assert!(result.expect("pull timed out").is_err());
+        }
+
+        let heads = heads.lock().unwrap();
+        let first_lines: Vec<&str> = heads.iter().filter_map(|h| h.lines().next()).collect();
+        assert!(
+            first_lines
+                .iter()
+                .any(|l| l.starts_with("CONNECT secure.invalid:443 ")),
+            "{first_lines:?}"
+        );
+        assert!(
+            first_lines
+                .iter()
+                .any(|l| l.starts_with("GET http://plain.invalid:5000/v2/")),
+            "{first_lines:?}"
+        );
+        for head in heads.iter() {
+            assert!(
+                head.lines().any(|l| l.eq_ignore_ascii_case(&format!("proxy-authorization: {credentials}"))),
+                "no credentials in {head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_builder_rejects_an_unusable_proxy_without_echoing_it() {
+        for bad in ["http://puddle:s3cret@", "s3cret: not a url"] {
+            let temp = tempdir().unwrap();
+            let cache = GlobalCache::new(temp.path()).unwrap();
+            let err = match super::Registry::builder(Platform::default(), cache)
+                .proxy(bad)
+                .build()
+            {
+                Ok(_) => panic!("{bad} should be refused"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, crate::ImageError::InvalidProxy(_)), "{err:?}");
+            assert!(!format!("{err} {err:?}").contains("s3cret"), "{err:?}");
+        }
+    }
+
     /// Generate a self-signed CA certificate and return PEM bytes.
     fn generate_test_ca_pem() -> Vec<u8> {
         let key_pair = rcgen::KeyPair::generate().unwrap();

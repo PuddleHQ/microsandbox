@@ -82,6 +82,10 @@ pub enum ImageError {
     #[error("invalid PEM certificate: {0}")]
     InvalidCertificate(String),
 
+    /// The registry proxy URL cannot be used.
+    #[error("invalid registry proxy: {0}")]
+    InvalidProxy(String),
+
     /// General I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
