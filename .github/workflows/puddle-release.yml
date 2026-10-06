@@ -1,0 +1,821 @@
+# puddle fork: build msb.exe for Windows (MSVC) from a v<release>-puddle.N tag, test it,
+# and publish it as a release asset next to upstream's libkrunfw.dll and the fork-built agentd.
+# The Linux msb is built from the same tag (build-linux) and published with upstream's Linux
+# libkrunfw, so Puddle's CI downloads it instead of building it (about 8 minutes per cache miss).
+#
+# Fork-only file (not in upstream). The kernel and libkrunfw stay upstream's: they are downloaded
+# from the matching upstream release and checked against its checksums.sha256. agentd is built here
+# (musl, x86_64) from the same source as msb, because the fork changes code that runs in the guest
+# (the per-client forward limit) and the host and guest must agree on it.
+#
+# Triggers:
+# * push of a tag v*-puddle.* whose commit contains this file: build, test, publish.
+# * workflow_dispatch with a tag (for tags made before this file existed): build and test;
+#   publish only when `publish` is true.
+# * push to the puddle branch that changes this file, .github/puddle/ or the repros: build and test the
+#   newest v*-puddle.* tag reachable from the pushed commit; never publishes.
+# * workflow_call from puddle-autobump.yml with `candidate: true`: the gates for a replayed stack that
+#   exists only as bundles in the caller's `puddle-candidate` artifact (.github/puddle/use-candidate.sh);
+#   `tag` is the tag it would get. Never publishes (the caller does, after every gate passed).
+name: puddle release
+
+on:
+  push:
+    tags: ["v*-puddle.*"]
+    branches: [puddle]
+    paths:
+      - .github/workflows/puddle-release.yml
+      - .github/puddle/**
+      - .github/workflows/puddle-repros.yml
+      - tests/puddle/**
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Fork tag to build, e.g. v0.7.7-puddle.2"
+        required: true
+        type: string
+      publish:
+        description: "Publish the GitHub release with the assets"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      tag:
+        description: "Fork tag the candidate would get, e.g. v0.7.8-puddle.1"
+        required: true
+        type: string
+      candidate:
+        description: "Build the caller's puddle-candidate artifact instead of the tag"
+        required: false
+        default: false
+        type: boolean
+      upstream_repo:
+        description: "Repo of the upstream release (assets and the candidate's base)"
+        required: false
+        default: superradcompany/microsandbox
+        type: string
+      upstream_tag:
+        description: "Upstream release tag the candidate is based on (default: tag without -puddle.N)"
+        required: false
+        default: ""
+        type: string
+    outputs:
+      prev_tag:
+        description: "Fork release the volume check started from"
+        value: ${{ jobs.prepare.outputs.prev_tag }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: puddle-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  UPSTREAM_REPO: ${{ inputs.upstream_repo || 'superradcompany/microsandbox' }}
+  CANDIDATE: ${{ inputs.candidate && 'true' || 'false' }}
+  RUST_TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  prepare:
+    name: Upstream assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tags.outputs.tag }}
+      version: ${{ steps.tags.outputs.version }}
+      upstream_tag: ${{ steps.tags.outputs.upstream_tag }}
+      prev_tag: ${{ steps.prev.outputs.prev_tag }}
+      skip: ${{ steps.tags.outputs.skip }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - name: Resolve tags
+        id: tags
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            TAG=$INPUT_TAG
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG=$GITHUB_REF_NAME
+          else
+            TAG=$(git describe --tags --match 'v*-puddle.*' --abbrev=0 HEAD)
+            # A version commit is pushed just before its tag. If the tag is not there yet, this run
+            # would rebuild the previous tag and report that tag's result against the new commit;
+            # the tag's own run gates the new version.
+            head_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+            if [ "v$head_version" != "$TAG" ]; then
+              echo "::notice::branch push: HEAD is version $head_version, newest reachable tag is $TAG; the v$head_version tag run tests it, skipping"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "branch push: checking the newest reachable fork tag $TAG (no publish)"
+          fi
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-puddle\.[1-9][0-9]*$ ]]; then
+            echo "::error::$TAG is not a v<MAJOR.MINOR.PATCH>-puddle.<N> tag"
+            exit 1
+          fi
+          upstream="${INPUT_UPSTREAM_TAG:-${TAG%-puddle.*}}"
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "upstream_tag=$upstream"
+          } >> "$GITHUB_OUTPUT"
+          echo "fork tag $TAG, upstream release $upstream"
+
+      - name: Previous fork release (volume check)
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tags.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prev=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --limit 50 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName | test(\"^v[0-9]+[.][0-9]+[.][0-9]+-puddle[.][0-9]+$\")) | select(.tagName != \"$TAG\")] | sort_by(.createdAt) | last | .tagName // empty")
+          echo "prev_tag=$prev" >> "$GITHUB_OUTPUT"
+          echo "previous fork release for the volume check: ${prev:-none}"
+
+      - name: Download upstream libkrunfw (Windows, Linux), agentd, checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.tags.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          gh release download "$UPSTREAM_TAG" -R "$UPSTREAM_REPO" -D upstream \
+            -p checksums.sha256 -p libkrunfw-windows-x86_64.dll -p libkrunfw-linux-x86_64.so -p agentd-x86_64
+
+      - name: Verify against upstream checksums.sha256
+        run: |
+          set -euo pipefail
+          v=.github/puddle/verify-asset.sh
+          bash "$v" upstream/checksums.sha256 upstream/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+          bash "$v" upstream/checksums.sha256 upstream/libkrunfw-linux-x86_64.so libkrunfw-linux-x86_64.so
+          bash "$v" upstream/checksums.sha256 upstream/agentd-x86_64 agentd-x86_64
+          # Self-test: a file with one byte changed must be refused.
+          cp upstream/agentd-x86_64 corrupted
+          printf '\x00' | dd of=corrupted bs=1 seek=4096 count=1 conv=notrunc status=none
+          if out=$(bash "$v" upstream/checksums.sha256 corrupted agentd-x86_64 2>&1); then
+            echo "::error::verify-asset.sh accepted a corrupted file"
+            exit 1
+          fi
+          echo "self-test ok: corrupted file refused: ${out#::error::}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-assets
+          path: upstream/
+          compression-level: 0
+
+  # The guest agent, built from the tag's own source: its limits must match the msb that embeds it.
+  build-agentd:
+    name: Build agentd (x86_64-linux-musl)
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-agentd
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Same command as the justfile's build-agentd.
+      - name: Build agentd
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target-dir target --target x86_64-unknown-linux-musl
+          mkdir -p out
+          cp target/x86_64-unknown-linux-musl/release/agentd out/agentd-x86_64
+          file out/agentd-x86_64
+          sha256sum out/agentd-x86_64
+
+      - name: agentd tests (the per-client forward limit)
+        run: cargo test --locked --manifest-path crates/agentd/Cargo.toml --target-dir target --target x86_64-unknown-linux-musl --lib -- bulk_output
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: puddle-agentd
+          path: out/agentd-x86_64
+          compression-level: 0
+
+  build-windows:
+    name: Build msb.exe + boot smoke (windows-2025)
+    needs: [prepare, build-agentd]
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
+
+      - name: Checkout libkrunfw MSVC helpers
+        shell: pwsh
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-release-windows
+          cache-on-failure: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: upstream/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: puddle-agentd
+          path: agentd/
+
+      # embed-binaries takes the prebuilt agentd from MSB_EMBED_ARTIFACTS_DIR (named `agentd`).
+      - name: Stage this run's agentd for embedding
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path embed | Out-Null
+          Copy-Item agentd\agentd-x86_64 embed\agentd -Force
+
+      # Upstream's MSVC steps (release-windows.yml "Build msb"), without download-binaries.
+      - name: Build msb
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}\embed
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture amd64 -HostArchitecture amd64
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target $env:RUST_TARGET
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          # out\ holds the release asset; runtime\ is the installed layout (msb looks for libkrunfw.dll).
+          New-Item -ItemType Directory -Force -Path out, runtime | Out-Null
+          Copy-Item "target\$env:RUST_TARGET\release\msb.exe" out\msb-windows-x86_64.exe -Force
+          Copy-Item out\msb-windows-x86_64.exe runtime\msb.exe -Force
+          Copy-Item upstream\libkrunfw-windows-x86_64.dll runtime\libkrunfw.dll -Force
+
+      # The Windows-only bootstrap root (crates/runtime/lib/runner/bootstrap_fs.rs) has no other CI:
+      # its mountpoints keep PID 1 alive when the kernel starts it without a console (T-164). The
+      # bind_rootfs tests check the same /dev for host-directory roots on the Windows file system
+      # (T-209). The log tests write 11 MiB to the real stderr of a child process that ran
+      # setup_log_capture and check that runtime.log rotated, which Windows did not do before (T-210).
+      - name: Runtime bootstrap-root, bind-root and log-rotation tests
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}\embed
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture amd64 -HostArchitecture amd64
+          cargo test --locked --release --no-default-features --features embed-binaries,net,runner `
+            -p microsandbox-runtime --lib --target $env:RUST_TARGET -- bootstrap_fs bind_rootfs log_thread stderr_capture runner::logging
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap_fs / bind_rootfs / log-rotation tests failed" }
+
+      - name: Embedded agentd is this run's
+        shell: pwsh
+        run: |
+          $want = (Get-FileHash agentd\agentd-x86_64 -Algorithm SHA256).Hash
+          $staged = Get-ChildItem "target\$env:RUST_TARGET\release\build" -Recurse -File -Filter agentd |
+            Where-Object { $_.FullName -match 'microsandbox-filesystem-[0-9a-f]+\\out\\agentd$' }
+          if (-not $staged) { throw "no staged agentd found under target\$env:RUST_TARGET\release\build" }
+          foreach ($f in $staged) {
+            $got = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+            "$($f.FullName): $got"
+            if ($got -ne $want) { throw "embedded agentd differs from this run's agentd-x86_64 ($want)" }
+          }
+          "embedded agentd = this run's agentd-x86_64 ($want)"
+
+      - name: Version and imports
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $line = (& out\msb-windows-x86_64.exe --version | Out-String).Trim()
+          "msb --version: $line"
+          if ($line -ne "msb $env:VERSION") { throw "msb --version printed '$line', want 'msb $env:VERSION'" }
+          python -m pip install --quiet --disable-pip-version-check pefile==2024.8.26
+          python _puddle\.github\puddle\check-msb-exe.py out\msb-windows-x86_64.exe $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "msb.exe checks failed" }
+
+      - name: Runtime discovery smoke (upstream script)
+        shell: pwsh
+        run: python scripts/smoke/cli/runtime-discovery.py --msb runtime/msb.exe --libkrunfw runtime/libkrunfw.dll
+
+      - name: Boot smoke (create, exec, stop, start, exec, remove)
+        shell: pwsh
+        run: ./_puddle/.github/puddle/boot-smoke.ps1 -Msb runtime\msb.exe -Libkrunfw runtime\libkrunfw.dll
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-windows-x86_64
+          path: out/msb-windows-x86_64.exe
+          compression-level: 0
+
+  # The Linux msb, built from the tag's own source like the Windows one, embedding this run's agentd.
+  # ubuntu-22.04 (glibc 2.35) so the binary also runs on older developer hosts.
+  build-linux:
+    name: Build msb (Linux, x86_64)
+    needs: [prepare, build-agentd]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-release-linux
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: upstream/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: puddle-agentd
+          path: agentd/
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
+      - name: Build msb, check version, linkage and runtime discovery
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash _puddle/.github/puddle/build-linux-msb.sh agentd/agentd-x86_64 upstream/libkrunfw-linux-x86_64.so "$VERSION" out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-linux-x86_64
+          path: out/msb-linux-x86_64
+          compression-level: 0
+
+  test-windows:
+    name: Patched crates, Windows tests (windows-2025)
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-test-windows
+          workspaces: |
+            . -> target
+            libkrun -> target
+
+      # vsock tail-loss fix (msb half): its tests only run on Windows.
+      - name: microsandbox-vsock tests
+        shell: pwsh
+        run: |
+          cargo test --locked -p microsandbox-vsock
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-vsock tests failed" }
+
+      # Share names (F8): a guest cannot reach a device, a trailing-dot name or a short-name alias.
+      - name: microsandbox-filesystem Windows passthrough tests
+        shell: pwsh
+        run: |
+          cargo test --locked --no-default-features -p microsandbox-filesystem --lib backends::passthroughfs::windows
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-filesystem Windows tests failed" }
+
+      - name: Checkout the locked libkrun fork commit
+        id: krun
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=$(grep -m1 -o 'git+https://github.com/PuddleHQ/libkrun?[a-z]*=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
+          sha=${src##*#}
+          echo "libkrun source from Cargo.lock: $src"
+          git init -q libkrun
+          git -C libkrun fetch -q --depth 1 https://github.com/PuddleHQ/libkrun "$sha"
+          git -C libkrun checkout -q FETCH_HEAD
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Guest journal fix (image): a new upper or volume image has real bytes over its 64 MiB journal,
+      # checked with the allocated ranges NTFS reports; a rootfs artifact stays sparse (the control).
+      - name: microsandbox-image ext4 tests (the journal range holds data)
+        shell: pwsh
+        run: |
+          cargo test --locked -p microsandbox-image --lib ext4:: -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-image ext4 tests failed" }
+
+      # Layer body resume (image): a layer the registry cancels part way through (HTTP/2 RST_STREAM
+      # CANCEL) continues with a Range request inside the same download.
+      - name: microsandbox-image layer download tests (a broken body resumes)
+        shell: pwsh
+        run: |
+          cargo test --locked -p microsandbox-image --lib layer:: -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-image layer tests failed" }
+
+      # libkrun fixes: credit stall + tail-loss shutdown order (vsock), unplug zero-fill (mem, Windows-only tests).
+      - name: msb_krun_devices tests
+        shell: pwsh
+        working-directory: libkrun
+        run: |
+          cargo test --locked --manifest-path src/devices/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "msb_krun_devices tests failed" }
+
+  test-linux:
+    name: Patched crates, Linux tests
+    needs: [prepare, build-agentd]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-test-linux
+          workspaces: |
+            . -> target
+            libkrun -> target
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
+      # The default features take agentd (filesystem crate) and the msb + libkrunfw pair (SDK) from
+      # MSB_EMBED_ARTIFACTS_DIR when it is set, else download them by crate version (which a
+      # simulated release doesn't have). Stage this run's agentd, as the Windows build does, plus
+      # upstream's verified Linux pair, because the SDK requires both once the variable is set.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: ${{ runner.temp }}/upstream
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: puddle-agentd
+          path: ${{ runner.temp }}/agentd
+
+      - name: Stage this run's agentd, upstream's msb and libkrunfw (Linux) for the build scripts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          up="$RUNNER_TEMP/upstream"
+          e="$RUNNER_TEMP/embed"
+          mkdir -p "$e" "$RUNNER_TEMP/linux"
+          gh release download "$UPSTREAM_TAG" -R "$UPSTREAM_REPO" -D "$RUNNER_TEMP/linux" \
+            -p msb-linux-x86_64 -p libkrunfw-linux-x86_64.so
+          v=_puddle/.github/puddle/verify-asset.sh
+          bash "$v" "$up/checksums.sha256" "$RUNNER_TEMP/linux/msb-linux-x86_64" msb-linux-x86_64
+          bash "$v" "$up/checksums.sha256" "$RUNNER_TEMP/linux/libkrunfw-linux-x86_64.so" libkrunfw-linux-x86_64.so
+          krunfw=$(sed -n 's/^pub const LIBKRUNFW_VERSION: &str = "\(.*\)";$/\1/p' crates/utils/lib/lib.rs)
+          [ -n "$krunfw" ] || { echo "::error::LIBKRUNFW_VERSION not found in crates/utils/lib/lib.rs"; exit 1; }
+          cp "$RUNNER_TEMP/agentd/agentd-x86_64" "$e/agentd"
+          install -m 755 "$RUNNER_TEMP/linux/msb-linux-x86_64" "$e/msb"
+          cp "$RUNNER_TEMP/linux/libkrunfw-linux-x86_64.so" "$e/libkrunfw.so.$krunfw"
+          ls -l "$e"
+          echo "MSB_EMBED_ARTIFACTS_DIR=$e" >> "$GITHUB_ENV"
+
+      # relay crash fix (runtime), forward limit (protocol, runtime), stale dir + ssh fixes (SDK), ssh
+      # fixes (CLI), guest journal fix (image formatter; the SDK lib tests cover the sandbox root and
+      # disk volume paths), layer body resume (image downloader).
+      - name: msb lib tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p microsandbox-image --lib ext4::
+          cargo test --locked -p microsandbox-image --lib layer::
+          cargo test --locked -p microsandbox-protocol --lib
+          cargo test --locked -p microsandbox-runtime --lib
+          cargo test --locked -p microsandbox --features ssh --lib
+          cargo test --locked -p microsandbox-cli --lib
+
+      - name: Checkout the locked libkrun fork commit
+        run: |
+          set -euo pipefail
+          src=$(grep -m1 -o 'git+https://github.com/PuddleHQ/libkrun?[a-z]*=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
+          sha=${src##*#}
+          echo "libkrun source from Cargo.lock: $src"
+          git init -q libkrun
+          git -C libkrun fetch -q --depth 1 https://github.com/PuddleHQ/libkrun "$sha"
+          git -C libkrun checkout -q FETCH_HEAD
+
+      - name: msb_krun_devices virtio tests
+        working-directory: libkrun
+        run: cargo test --locked -p msb_krun_devices 'virtio::'
+
+  # Regression repros (tests/puddle/repros.ps1) against the msb.exe built above; gate publishing.
+  repros:
+    name: Regression repros
+    needs: [prepare, build-windows]
+    uses: ./.github/workflows/puddle-repros.yml
+    with:
+      msb_artifact: msb-windows-x86_64
+
+  # Gates added for .14 (T-342). Each is the standalone workflow called with this run's tag; they are
+  # skipped for an autobump candidate (their source is not a tag checkout), which the workflows'
+  # own push runs on `puddle` then cover after the stack lands.
+  launcher-isolation:
+    name: Launcher isolation
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true' && !inputs.candidate
+    uses: ./.github/workflows/puddle-launcher-isolation.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
+  vsock-tail:
+    name: Vsock tail
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true' && !inputs.candidate
+    uses: ./.github/workflows/puddle-vsock-tail.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
+  forward-cap-linux:
+    name: Forward cap Linux
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true' && !inputs.candidate
+    uses: ./.github/workflows/puddle-forward-cap.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
+  linux-discard:
+    name: Linux discard
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true' && !inputs.candidate
+    uses: ./.github/workflows/puddle-linux-discard.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
+  root-journal:
+    name: Root-disk journal
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true' && !inputs.candidate
+    uses: ./.github/workflows/puddle-root-journal.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
+  # A workspace volume made by the previous fork release opens, reads and writes on this build.
+  volume-compat:
+    name: Volume from the previous release
+    needs: [prepare, build-windows]
+    if: needs.prepare.outputs.prev_tag != ''
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: msb-windows-x86_64
+          path: new/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: new/
+
+      - name: Previous release ${{ needs.prepare.outputs.prev_tag }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV: ${{ needs.prepare.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$PREV" -R "$GITHUB_REPOSITORY" -D old \
+            -p checksums.sha256 -p msb-windows-x86_64.exe -p libkrunfw-windows-x86_64.dll
+          v=.github/puddle/verify-asset.sh
+          bash "$v" old/checksums.sha256 old/msb-windows-x86_64.exe msb-windows-x86_64.exe
+          bash "$v" old/checksums.sha256 old/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+
+      - name: Install layouts
+        shell: pwsh
+        run: |
+          foreach ($d in 'old', 'new') {
+            New-Item -ItemType Directory -Force -Path "rt-$d" | Out-Null
+            Copy-Item "$d\msb-windows-x86_64.exe" "rt-$d\msb.exe" -Force
+            Copy-Item "$d\libkrunfw-windows-x86_64.dll" "rt-$d\libkrunfw.dll" -Force
+            & "rt-$d\msb.exe" --version
+          }
+
+      - name: Volume made by ${{ needs.prepare.outputs.prev_tag }} opens on ${{ needs.prepare.outputs.tag }}
+        shell: pwsh
+        run: |
+          $w = Join-Path $env:RUNNER_TEMP 'vc'
+          ./tests/puddle/run-outside-job.ps1 -Script tests/puddle/volume-compat.ps1 -Log "$w-log/volume-compat.log" -TimeoutSec 1200 -- `
+            -OldMsb "$PWD\rt-old\msb.exe" -OldLibkrunfw "$PWD\rt-old\libkrunfw.dll" `
+            -NewMsb "$PWD\rt-new\msb.exe" -NewLibkrunfw "$PWD\rt-new\libkrunfw.dll" -Work $w
+          exit $LASTEXITCODE
+
+  release:
+    name: Publish release
+    needs: [prepare, build-agentd, build-windows, build-linux, test-windows, test-linux, repros, volume-compat, launcher-isolation, vsock-tail, forward-cap-linux, linux-discard, root-journal]
+    if: >-
+      !cancelled() && !inputs.candidate && (github.ref_type == 'tag' || inputs.publish) &&
+      needs.prepare.result == 'success' && needs.build-agentd.result == 'success' &&
+      needs.build-windows.result == 'success' && needs.build-linux.result == 'success' &&
+      needs.test-windows.result == 'success' && needs.test-linux.result == 'success' &&
+      needs.repros.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.volume-compat.result) &&
+      needs.launcher-isolation.result == 'success' && needs.vsock-tail.result == 'success' &&
+      needs.forward-cap-linux.result == 'success' && needs.linux-discard.result == 'success' &&
+      needs.root-journal.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: upstream/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: msb-windows-x86_64
+          path: assets/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: msb-linux-x86_64
+          path: assets/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: puddle-agentd
+          path: assets/
+
+      - name: Create release and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash _puddle/.github/puddle/publish-release.sh "$TAG" "$UPSTREAM_REPO" "$UPSTREAM_TAG" "$RUN_URL" assets upstream

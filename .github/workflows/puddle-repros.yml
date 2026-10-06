@@ -1,0 +1,127 @@
+# puddle fork: regression repros for the fork's msb fixes, one job per case, on windows-2025.
+#
+# Fork-only file. The cases live in tests/puddle/repros.ps1 (relay crash, ssh signal exit, scp
+# exit, forward reason, stale dir on a rejected create, russh session wedge, boots under load, 2-vCPU
+# boots without a console at PID 1, bind-root boots without /dev, more than 64 forwards on one ssh session). Each
+# passes when msb behaves as fixed.
+#
+# * workflow_call from puddle-release.yml: tests the msb.exe that run just built (artifact
+#   `msb-windows-x86_64`) with upstream's libkrunfw (artifact `upstream-assets`); gates publishing.
+# * workflow_dispatch: tests a published release's msb-windows-x86_64.exe + libkrunfw dll, e.g.
+#   repo PuddleHQ/microsandbox tag v0.7.7-puddle.2 (green), or superradcompany/microsandbox tag
+#   v0.7.7 (stock: every case red). Downloads only; nothing is written anywhere.
+name: puddle repros
+
+on:
+  workflow_call:
+    inputs:
+      msb_artifact:
+        description: "Artifact with msb-windows-x86_64.exe from the calling run"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_repo:
+        description: "Repo whose release to test"
+        required: true
+        default: PuddleHQ/microsandbox
+        type: string
+      release_tag:
+        description: "Release tag, e.g. v0.7.7-puddle.2 (or v0.7.7 on superradcompany/microsandbox for stock)"
+        required: true
+        type: string
+      cases:
+        description: "Comma-separated cases (default all)"
+        required: false
+        default: "relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp,boot-bind,forward-cap"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cases:
+    name: Repro ${{ matrix.case }}
+    runs-on: windows-2025
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [relay, signal, scp, forward, stale-dir, wedge, boot, boot-smp, boot-bind, forward-cap]
+    steps:
+      - name: Skip cases not asked for
+        id: want
+        shell: pwsh
+        env:
+          CASES: ${{ inputs.cases || 'relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp,boot-bind,forward-cap' }}
+        run: |
+          $want = ($env:CASES -split ',' | ForEach-Object { $_.Trim() }) -contains '${{ matrix.case }}'
+          "run=$($want.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "case ${{ matrix.case }}: run=$want"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.want.outputs.run == 'true'
+        with:
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+
+      - name: msb.exe from this run
+        if: steps.want.outputs.run == 'true' && inputs.msb_artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.msb_artifact }}
+          path: dl/
+
+      - name: Upstream libkrunfw from this run
+        if: steps.want.outputs.run == 'true' && inputs.msb_artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: dl/
+
+      - name: msb.exe + libkrunfw from release ${{ inputs.release_repo }}@${{ inputs.release_tag }}
+        if: steps.want.outputs.run == 'true' && !inputs.msb_artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ inputs.release_repo }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$REPO" -D dl \
+            -p checksums.sha256 -p msb-windows-x86_64.exe -p libkrunfw-windows-x86_64.dll
+          v=.github/puddle/verify-asset.sh
+          bash "$v" dl/checksums.sha256 dl/msb-windows-x86_64.exe msb-windows-x86_64.exe
+          bash "$v" dl/checksums.sha256 dl/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+
+      - name: Install layout
+        if: steps.want.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path runtime | Out-Null
+          Copy-Item dl\msb-windows-x86_64.exe runtime\msb.exe -Force
+          Copy-Item dl\libkrunfw-windows-x86_64.dll runtime\libkrunfw.dll -Force
+          & runtime\msb.exe --version
+          (Get-FileHash runtime\msb.exe -Algorithm SHA256).Hash
+
+      - name: Run repro ${{ matrix.case }}
+        if: steps.want.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          $node = (Get-Command node).Source
+          "node: $node ($(& $node --version)); OpenSSH: $((Get-Item "$env:SystemRoot\System32\OpenSSH\ssh.exe").VersionInfo.ProductVersion)"
+          $w = Join-Path $env:RUNNER_TEMP 'r'
+          ./tests/puddle/run-outside-job.ps1 -Script tests/puddle/repros.ps1 -Log "$w-log/repros.log" -TimeoutSec 1200 -- `
+            -Msb "$PWD\runtime\msb.exe" -Libkrunfw "$PWD\runtime\libkrunfw.dll" -Case ${{ matrix.case }} `
+            -Work $w -Node $node
+          exit $LASTEXITCODE
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && steps.want.outputs.run == 'true'
+        with:
+          name: repro-logs-${{ matrix.case }}
+          path: |
+            ${{ runner.temp }}/r-log/
+            ${{ runner.temp }}/r/logs/
+          if-no-files-found: ignore

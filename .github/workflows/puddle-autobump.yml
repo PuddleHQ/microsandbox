@@ -1,0 +1,374 @@
+# puddle fork: follow upstream msb releases (puddle D-56/D-57). Fork-only file.
+#
+# Every 6 hours (and on dispatch): find the newest upstream release that is ready (published, not a
+# draft or prerelease, has checksums.sha256 and the assets the gates use). Skip it when a fork tag
+# v<release>-puddle.* already exists or an auto-bump PR/issue for it is open; never build an older
+# release than the fork's. Otherwise:
+#   replay   rebuild the patch stack on the release tag (.github/puddle/replay.py, manifest
+#            .github/puddle/stack.txt), with the libkrun / russh legs when their base moved. Builds
+#            only bundles; nothing is pushed yet.
+#   gates    puddle-release.yml on the candidate: MSVC build, patched crates' tests, boot smoke,
+#            regression repros, a volume from the previous fork release opening on the new build.
+#   finalize green: push the legs and the bump branch, PR into `puddle`, fast-forward `puddle`, tag
+#            v<release>-puddle.N, publish the release (all in this run), then the pin-bump PR in the
+#            product repo (only when secret PUDDLE_PIN_TOKEN exists). Red or conflict: one issue
+#            per release, updated with a comment on later runs, never duplicated.
+#
+# Pushing commits that touch .github/workflows needs a token with the Workflows permission, which
+# GITHUB_TOKEN can't have: the pushes use secret PUDDLE_FORKS_TOKEN. Without it a green run opens
+# the issue with the commands to land the candidate by hand (.github/puddle/land.sh).
+#
+# Dry run (dispatch default): everything up to and including the gates; finalize only writes what it
+# would do to the run summary. Publishes nothing (the candidate is only an artifact of the run).
+name: puddle auto-bump
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: replay and gates only, publish nothing"
+        type: boolean
+        default: true
+      release:
+        description: "Release tag to bump to (default: newest ready upstream release)"
+        type: string
+        default: ""
+      upstream_repo:
+        description: "Repo the release lives in (a test release in this fork for simulations)"
+        type: string
+        default: superradcompany/microsandbox
+      force:
+        description: "Run even if the release is already tagged, older, or has an open PR/issue (next -puddle.N)"
+        type: boolean
+        default: false
+      allow_prerelease:
+        description: "Accept a prerelease (dry-run simulations only)"
+        type: boolean
+        default: false
+      force_legs:
+        description: "Replay the libkrun and russh forks even if their base did not move (dry-run test)"
+        type: boolean
+        default: false
+      inject_conflict:
+        description: "Make the first fix conflict on purpose (dry-run test)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Real runs one at a time; dry runs (which push nothing) in parallel.
+concurrency:
+  group: puddle-autobump-${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && github.run_id || 'real' }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ${{ inputs.upstream_repo || 'superradcompany/microsandbox' }}
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+
+jobs:
+  watch:
+    name: Upstream release ready?
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      go: ${{ steps.pick.outputs.go }}
+      release: ${{ steps.pick.outputs.release }}
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - name: Pick the release
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE: ${{ inputs.release }}
+          FORCE: ${{ inputs.force && 'true' || 'false' }}
+          ALLOW_PRE: ${{ inputs.allow_prerelease && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          skip() { echo "skip: $*" | tee -a "$GITHUB_STEP_SUMMARY"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          if [ "$DRY_RUN" != true ] && { [ "$ALLOW_PRE" = true ] || [ "$UPSTREAM_REPO" != superradcompany/microsandbox ]; }; then
+            echo "::error::prereleases and other source repos are for dry runs only"; exit 1
+          fi
+          rel=$INPUT_RELEASE
+          if [ -z "$rel" ]; then
+            # Newest published vX.Y.Z release; with two between checks only the newest is built (D-57).
+            rel=$(gh release list -R "$UPSTREAM_REPO" --exclude-drafts --exclude-pre-releases --limit 30 \
+              --json tagName,publishedAt --jq '[.[] | select(.tagName | test("^v[0-9]+[.][0-9]+[.][0-9]+$"))] | sort_by(.publishedAt) | last | .tagName // empty')
+            [ -n "$rel" ] || skip "no release found in $UPSTREAM_REPO"
+          fi
+          info=$(gh release view "$rel" -R "$UPSTREAM_REPO" --json tagName,isDraft,isPrerelease,publishedAt,assets)
+          echo "$info" | jq '{tagName, isDraft, isPrerelease, publishedAt, assets: [.assets[].name] | length}'
+          [ "$(echo "$info" | jq -r .isDraft)" = false ] || skip "$rel is a draft"
+          if [ "$(echo "$info" | jq -r .isPrerelease)" = true ] && [ "$ALLOW_PRE" != true ]; then skip "$rel is a prerelease"; fi
+          for a in checksums.sha256 libkrunfw-windows-x86_64.dll agentd-x86_64 msb-linux-x86_64 libkrunfw-linux-x86_64.so; do
+            echo "$info" | jq -e --arg a "$a" '.assets[] | select(.name == $a)' >/dev/null || skip "$rel has no $a yet (still building)"
+          done
+          x=$(echo "$rel" | sed -n 's/^.*v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p')
+          [ -n "$x" ] || { echo "::error::cannot read a version from $rel"; exit 1; }
+          # Fork state: tags for this release, the newest fork tag overall.
+          n=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" "refs/tags/v$x-puddle.*" \
+            | sed -n 's/.*-puddle\.\([0-9]*\)$/\1/p' | sort -n | tail -1)
+          newest=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" 'refs/tags/v*-puddle.*' \
+            | sed -n 's/.*refs\/tags\/v\([0-9]*\.[0-9]*\.[0-9]*\)-puddle\.[0-9]*$/\1/p' | sort -V | tail -1)
+          if [ "$FORCE" != true ]; then
+            [ -z "$n" ] || skip "v$x-puddle.$n already exists"
+            if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$x" | sort -V | tail -1)" != "$x" ]; then
+              skip "$rel is older than the fork's $newest"
+            fi
+            pr=$(gh pr list -R "$GITHUB_REPOSITORY" --head "puddle-bump/v$x-puddle.1" --state open --json number --jq '.[0].number // empty')
+            [ -z "$pr" ] || skip "auto-bump PR #$pr for $rel is open"
+            issue=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"auto-bump: $rel\" in:title" --json number,title \
+              --jq "[.[] | select(.title == \"auto-bump: $rel\")][0].number // empty" 2>/dev/null || true)
+            [ -z "$issue" ] || skip "issue #$issue for $rel is open (fix it, close it, or dispatch with force)"
+          fi
+          version="$x-puddle.$(( ${n:-0} + 1 ))"
+          {
+            echo "go=true"
+            echo "release=$rel"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "### $UPSTREAM_REPO $rel is ready: building v$version (dry run: $DRY_RUN)" >> "$GITHUB_STEP_SUMMARY"
+
+  replay:
+    name: Replay the patch stack
+    needs: watch
+    if: needs.watch.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      status: ${{ steps.replay.outputs.status }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Fetch the release and the previous base
+        env:
+          REL: ${{ needs.watch.outputs.release }}
+        run: |
+          set -euo pipefail
+          git fetch -q --no-tags "https://github.com/$UPSTREAM_REPO" "refs/tags/$REL:refs/tags/$REL"
+          prev=$(git describe --tags --first-parent --abbrev=0 --match 'v*-puddle.*' HEAD)
+          base=${prev%-puddle.*}
+          git fetch -q --no-tags https://github.com/superradcompany/microsandbox "refs/tags/$base:refs/tags/$base"
+          echo "previous fork tag $prev on $base; new release $REL = $(git rev-parse "$REL^{commit}")"
+
+      - name: Replay
+        id: replay
+        env:
+          REL: ${{ needs.watch.outputs.release }}
+          VERSION: ${{ needs.watch.outputs.version }}
+          FORCE_LEGS: ${{ inputs.force_legs && 'true' || 'false' }}
+          INJECT: ${{ inputs.inject_conflict && 'true' || 'false' }}
+        run: |
+          # No -e (Actions' default): exit code 3 (conflict) is a result, handled below.
+          set +e -uo pipefail
+          git config --global user.name "puddle auto-bump"
+          git config --global user.email puddle@tijsvankampen.be
+          extra=()
+          if [ "$FORCE_LEGS" = true ] || [ "$INJECT" = true ]; then
+            [ "$DRY_RUN" = true ] || { echo "::error::force_legs and inject_conflict are dry-run tests"; exit 1; }
+          fi
+          [ "$FORCE_LEGS" = true ] && extra+=(--force-legs)
+          [ "$INJECT" = true ] && extra+=(--inject-conflict)
+          head=$(git rev-parse HEAD)
+          w="$RUNNER_TEMP/candidate"
+          # The replay checks out other commits in this clone: run the script from a copy.
+          cp -r .github/puddle "$RUNNER_TEMP/tools"
+          python3 "$RUNNER_TEMP/tools/replay.py" --repo . --stack-ref "$head" --upstream-tag "$REL" \
+            --upstream-sha "$(git rev-parse "$REL^{commit}")" --version "$VERSION" \
+            --manifest "$RUNNER_TEMP/tools/stack.txt" --work "$w" "${extra[@]}"
+          rc=$?
+          cat "$w/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+          case $rc in
+            0) echo "status=ok" >> "$GITHUB_OUTPUT" ;;
+            3) echo "status=conflict" >> "$GITHUB_OUTPUT" ;;
+            *) echo "status=error" >> "$GITHUB_OUTPUT"; exit "$rc" ;;
+          esac
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: puddle-candidate
+          path: |
+            ${{ runner.temp }}/candidate/*.bundle
+            ${{ runner.temp }}/candidate/*.json
+            ${{ runner.temp }}/candidate/summary.md
+          if-no-files-found: ignore
+
+  gates:
+    name: Gates
+    needs: [watch, replay]
+    if: needs.replay.outputs.status == 'ok'
+    permissions:
+      contents: write # requested by the called workflow's publish job, which never runs for a candidate
+    uses: ./.github/workflows/puddle-release.yml
+    with:
+      tag: v${{ needs.watch.outputs.version }}
+      candidate: true
+      upstream_repo: ${{ inputs.upstream_repo || 'superradcompany/microsandbox' }}
+      upstream_tag: ${{ needs.watch.outputs.release }}
+
+  finalize:
+    name: Land, or report
+    needs: [watch, replay, gates]
+    if: ${{ !cancelled() && needs.watch.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: read
+    env:
+      REL: ${{ needs.watch.outputs.release }}
+      VERSION: ${{ needs.watch.outputs.version }}
+      REPLAY: ${{ needs.replay.outputs.status || needs.replay.result }}
+      GATES: ${{ needs.gates.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      HAS_FORKS_TOKEN: ${{ secrets.PUDDLE_FORKS_TOKEN != '' && 'true' || 'false' }}
+      HAS_PIN_TOKEN: ${{ secrets.PUDDLE_PIN_TOKEN != '' && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Verdict
+        id: verdict
+        run: |
+          set -euo pipefail
+          if [ "$REPLAY" = ok ] && [ "$GATES" = success ]; then v=green
+          elif [ "$REPLAY" = ok ]; then v="gates $GATES"
+          else v="replay $REPLAY"; fi
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"
+          echo "### Auto-bump $REL -> v$VERSION: $v (dry run: $DRY_RUN)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run - what a real run would do
+        if: env.DRY_RUN == 'true'
+        env:
+          V: ${{ steps.verdict.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          c="$RUNNER_TEMP/candidate/candidate.json"
+          {
+            echo
+            if [ "$V" = green ]; then
+              echo "A real run would now (with PUDDLE_FORKS_TOKEN: $HAS_FORKS_TOKEN):"
+              for leg in libkrun russh; do
+                jq -e --arg l "$leg" '.[$l]' "$c" >/dev/null && jq -r --arg l "$leg" '.[$l] | "- push \(.url) branch \(.branch) = \(.sha)"' "$c"
+              done
+              jq -r '.msb | "- push branch puddle-bump/v'"$VERSION"' = \(.merge) and open the PR into puddle\n- fast-forward puddle \(.old) -> \(.merge)\n- tag v'"$VERSION"' = \(.sha) and publish the release from this run'"'"'s artifacts"' "$c"
+              echo "- open the pin-bump PR in PuddleHQ/puddle (PUDDLE_PIN_TOKEN: $HAS_PIN_TOKEN; skipped without it)"
+            else
+              echo "A real run would open or update the issue \"auto-bump: $REL\" with the verdict ($V), the replay summary and $RUN_URL."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$V" = green ] || exit 1
+
+      - name: Red - issue for this release
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict != 'green'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.verdict.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          title="auto-bump: $REL"
+          {
+            echo "The auto-bump to upstream \`$REL\` (would be \`v$VERSION\`) stopped: **$V**. Run: $RUN_URL"
+            echo
+            cat "$RUNNER_TEMP/candidate/summary.md" 2>/dev/null || echo "(no replay summary: see the run)"
+            echo
+            echo "A human steps in (D-56): fix the stack on \`puddle\` (and \`.github/puddle/stack.txt\`), then dispatch puddle-autobump with \`force\`. Later scheduled runs skip $REL while this issue is open."
+          } > body.md
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state all --search "\"$title\" in:title" --json number,title \
+            --jq "[.[] | select(.title == \"$title\")][0].number // empty")
+          if [ -n "$n" ]; then
+            gh issue reopen "$n" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+            gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+          fi
+          exit 1
+
+      - name: Green without PUDDLE_FORKS_TOKEN - issue with the landing commands
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict == 'green' && env.HAS_FORKS_TOKEN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="auto-bump: $REL"
+          {
+            echo "Upstream \`$REL\` replayed and **every gate passed** ($RUN_URL), but this run can't push it: the new commits touch \`.github/workflows\`, which GITHUB_TOKEN may not push. Add secret \`PUDDLE_FORKS_TOKEN\` (see the workflow header), or land it from a clone of this fork with your own login:"
+            echo
+            echo '```sh'
+            echo "gh run download $GITHUB_RUN_ID -R $GITHUB_REPOSITORY -n puddle-candidate -D cand-$VERSION"
+            echo "git fetch origin && git checkout --detach origin/puddle"
+            echo "bash .github/puddle/land.sh cand-$VERSION $VERSION $REL   # the tag push then builds and publishes v$VERSION"
+            echo '```'
+            echo
+            cat "$RUNNER_TEMP/candidate/summary.md"
+          } > body.md
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number,title \
+            --jq "[.[] | select(.title == \"$title\")][0].number // empty")
+          if [ -n "$n" ]; then gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body-file body.md
+          else gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file body.md; fi
+          exit 1
+
+      - name: Green - push, PR, merge, tag
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict == 'green' && env.HAS_FORKS_TOKEN == 'true'
+        env:
+          FORKS_TOKEN: ${{ secrets.PUDDLE_FORKS_TOKEN }}
+          GH_TOKEN: ${{ secrets.PUDDLE_FORKS_TOKEN }}
+        run: bash .github/puddle/land.sh "$RUNNER_TEMP/candidate" "$VERSION" "$REL"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict == 'green' && env.HAS_FORKS_TOKEN == 'true'
+        with:
+          name: msb-windows-x86_64
+          path: ${{ runner.temp }}/assets
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict == 'green' && env.HAS_FORKS_TOKEN == 'true'
+        with:
+          name: msb-linux-x86_64
+          path: ${{ runner.temp }}/assets
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict == 'green' && env.HAS_FORKS_TOKEN == 'true'
+        with:
+          name: puddle-agentd
+          path: ${{ runner.temp }}/assets
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict == 'green' && env.HAS_FORKS_TOKEN == 'true'
+        with:
+          name: upstream-assets
+          path: ${{ runner.temp }}/upstream
+
+      - name: Green - publish the release
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict == 'green' && env.HAS_FORKS_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          { echo "Made by the auto-bump job; replay summary:"; echo; sed 's/^###/####/' "$RUNNER_TEMP/candidate/summary.md"; } > notes-extra.md
+          bash .github/puddle/publish-release.sh "v$VERSION" "$UPSTREAM_REPO" "$REL" "$RUN_URL" \
+            "$RUNNER_TEMP/assets" "$RUNNER_TEMP/upstream" notes-extra.md
+
+      - name: Green - pin-bump PR in the product repo (D-60; off until PUDDLE_PIN_TOKEN exists)
+        if: env.DRY_RUN != 'true' && steps.verdict.outputs.verdict == 'green' && env.HAS_FORKS_TOKEN == 'true' && env.HAS_PIN_TOKEN == 'true'
+        env:
+          PIN_TOKEN: ${{ secrets.PUDDLE_PIN_TOKEN }}
+        run: bash .github/puddle/pin-pr.sh "$VERSION" "${{ github.server_url }}/${{ github.repository }}/releases/tag/v$VERSION"

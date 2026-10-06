@@ -1,0 +1,47 @@
+# puddle fork patch stack: how .github/puddle/replay.py rebuilds the `puddle` branch on a new
+# upstream release (fork-only file, generated from the restack manifest). One commit per fix: every
+# commit on `puddle` since its upstream base matches one rule; an unmatched commit stops the replay,
+# so a new fix gets a line here when it lands.
+#
+# Columns, separated by " | ":
+#   action    pick     cherry-pick the commit; dropped when it comes out empty (upstream has it)
+#             deps     regenerate: [patch.crates-io] for the libkrun, russh and imago forks
+#             version  regenerate as the last commit: workspace version and `=` pins become
+#                      <release>-puddle.N; the commit's other files (not Cargo.*) are kept
+#   match     the commit subject; a trailing * matches a prefix. First matching line wins.
+#   folder    puddle's upstream-issues/ folder (the filing list), or -
+#   upstream  owner/repo#N of the upstream PR once filed, or -. A merged PR whose merge commit is
+#             in the new release drops the commit.
+#
+# action  | match | folder | upstream
+deps | build: use the puddle forks* | - | -
+pick | ci(puddle):* | - | -
+pick | fix(ssh): report refused forwards as connect failed | msb-ssh-forward-connect-failed | -
+pick | fix(ssh): report SFTP exit status so scp exits 0 | msb-ssh-sftp-exit-status | -
+pick | fix(ssh): preserve failed command outcomes | msb-ssh-signal-exit-status | superradcompany/microsandbox#2011
+pick | fix(vsock): write queued guest bytes before closing a named-pipe route | msb-vsock-close-tail-loss | -
+pick | fix(agentd): send the bulk finish before a TCP read failure | msb-forward-reset-no-close | -
+pick | feat(image): add a proxy option to the registry client | msb-registry-proxy-option | -
+pick | fix(runtime): give a bind rootfs a /dev before the guest boots | msb-bind-rootfs-dev | -
+pick | fix(runtime): raise the per-client forward limit from 64 to 256 | msb-forward-cap-retry | -
+pick | fix(runtime): rotate runtime.log on Windows like on Unix | msb-windows-log-rotation | -
+pick | fix(image): retry transient registry failures and report a failed token request | msb-registry-transient-retry | -
+pick | fix(sdk): start the sandbox process in a session and console of its own | msb-console-isolation | -
+pick | fix(db): retry connecting to the catalog on a transient SQLite I/O error | msb-sqlite-open-io-error | -
+pick | fix(image): write the ext4 journal when an upper or volume image is created | msb-guest-fsync-latency | -
+pick | fix(image): resume a layer download whose body broke off | msb-layer-body-resume | -
+pick | fix(image): give each layer download a connection of its own | msb-layer-connections | -
+pick | fix(local): keep a killed runtime live until its thread group exits | msb-reconcile-zombie-runtime-disk-lock | -
+pick | feat(runtime): MSB_BLOCK_GROW_AHEAD turns block grow-ahead on or off | msb-guest-fsync-latency | -
+pick | feat(sdk): LocalBackendBuilder takes the runtime paths explicitly and can ignore MSB_* | msb-sdk-explicit-runtime-paths | -
+pick | fix(agentd): keep a block-backed overlay upper reachable so the root disk can be trimmed | msb-root-disk-fstrim | -
+pick | fix(sdk): create the SSH host key atomically so concurrent servers agree | msb-ssh-host-key-create-race | -
+pick | fix(filesystem): cap the handles a guest can hold open on one passthrough mount | - | -
+pick | fix(runtime): quota and clean up the bootstrap root, cap an unrotatable exec.log | - | -
+pick | fix(filesystem): refuse Windows device, trailing-dot and short-name aliases in share names | - | -
+pick | test(fuzz): FUSE request fuzz targets for the passthrough and memory filesystem backends | - | -
+pick | fix(vsock): 128 connections per route instead of 256, flood tests | - | -
+pick | test(vsock): guest writes of 4 to 128 KiB per call arrive intact on a route | msb-krun-vsock-multi-descriptor-tx | -
+pick | fix(agentd): give every guest process a SIGTERM and a grace period at shutdown | - | -
+pick | fix(db): open the catalog's first connection outside the pool's connect timeout | - | -
+version | build: version the puddle fork as* | - | -
