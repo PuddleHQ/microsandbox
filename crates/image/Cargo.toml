@@ -25,6 +25,7 @@ msb_krun = { workspace = true, features = ["blk"] }
 oci-client.workspace = true
 oci-spec.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 rustls-pki-types.workspace = true
 scopeguard.workspace = true
 scc.workspace = true

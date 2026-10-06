@@ -4036,6 +4036,7 @@ dependencies = [
  "oci-spec",
  "rand 0.10.3",
  "rcgen",
+ "reqwest",
  "rustls-pki-types",
  "scc",
  "scopeguard",

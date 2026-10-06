@@ -25,6 +25,7 @@ pub struct RegistryBuilder {
     pub(super) auth: oci_client::secrets::RegistryAuth,
     pub(super) insecure_registries: Vec<String>,
     pub(super) extra_ca_certs: Vec<Vec<u8>>,
+    pub(super) proxy: Option<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -40,6 +41,7 @@ impl RegistryBuilder {
             auth: oci_client::secrets::RegistryAuth::Anonymous,
             insecure_registries: Vec::new(),
             extra_ca_certs: Vec::new(),
+            proxy: None,
         }
     }
 
@@ -63,6 +65,19 @@ impl RegistryBuilder {
     /// Add PEM-encoded CA root certificates to trust.
     pub fn extra_ca_certs(mut self, certs: Vec<Vec<u8>>) -> Self {
         self.extra_ca_certs = certs;
+        self
+    }
+
+    /// Send every registry request through this proxy.
+    ///
+    /// The URL may carry credentials (`http://user:token@127.0.0.1:3128`) and is used for both
+    /// HTTPS (`CONNECT`) and plain HTTP registries. It is in effect instead of the process
+    /// environment: `HTTP(S)_PROXY`, `ALL_PROXY` and `NO_PROXY` are not consulted for any
+    /// request, so a caller can route pulls without putting the proxy (or its credentials) into
+    /// the environment that child processes inherit. An unusable URL fails [`build`](Self::build)
+    /// with [`ImageError::InvalidProxy`]; it never falls back to a direct connection.
+    pub fn proxy(mut self, url: impl Into<String>) -> Self {
+        self.proxy = Some(url.into());
         self
     }
 
@@ -99,10 +114,20 @@ impl RegistryBuilder {
             }
         }
 
+        // `Client::new` swallows a bad proxy and falls back to a default client, which would
+        // read the environment or connect directly; validate here so a bad URL is an error.
+        // The message names the failure, not the URL: it can hold credentials.
+        if let Some(url) = &self.proxy {
+            reqwest::Proxy::all(url)
+                .map_err(|e| ImageError::InvalidProxy(e.without_url().to_string()))?;
+        }
+
         let platform = self.platform.clone();
         let client = Client::new(ClientConfig {
             protocol,
             extra_root_certificates,
+            https_proxy: self.proxy.clone(),
+            http_proxy: self.proxy,
             platform_resolver: Some(Box::new(move |manifests| {
                 resolve_platform_digest(manifests, &platform)
             })),

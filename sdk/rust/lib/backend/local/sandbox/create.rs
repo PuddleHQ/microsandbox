@@ -1572,12 +1572,15 @@ impl LocalBackend {
             if registry_overrides.insecure {
                 insecure.push(pinned_ref.registry().to_string());
             }
-            let registry =
+            let mut builder =
                 Registry::builder(microsandbox_image::Platform::host_linux(), cache.clone())
                     .auth(auth)
                     .extra_ca_certs(ca_certs)
-                    .add_insecure_registries(insecure)
-                    .build()?;
+                    .add_insecure_registries(insecure);
+            if let Some(proxy) = self.registry_proxy() {
+                builder = builder.proxy(proxy);
+            }
+            let registry = builder.build()?;
             let pull_result = registry.pull_snapshot_metadata(&pinned_ref).await?;
             return Ok(ResolvedOciImage {
                 cache_operation: cache,
@@ -1705,11 +1708,14 @@ impl LocalBackend {
         let config = self
             .registry_config(image_ref.registry(), registry_overrides)
             .await?;
-        let registry = Registry::builder(platform, cache.clone())
+        let mut builder = Registry::builder(platform, cache.clone())
             .auth(config.auth)
             .extra_ca_certs(config.ca_certs)
-            .add_insecure_registries(config.insecure_registries)
-            .build()?;
+            .add_insecure_registries(config.insecure_registries);
+        if let Some(proxy) = config.proxy {
+            builder = builder.proxy(proxy);
+        }
+        let registry = builder.build()?;
 
         if let Some(sender) = progress {
             let task = registry.pull_with_sender(&image_ref, &options, sender);
