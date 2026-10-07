@@ -25,4 +25,4 @@ mod tests {
 pub use microsandbox_types::SandboxLogLevel as LogLevel;
 
 #[cfg(feature = "runner")]
-pub use crate::runner::logging::RotatingLog;
+pub use crate::runner::logging::{RotatingLog, RotationEvent};

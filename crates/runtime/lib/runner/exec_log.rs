@@ -129,10 +129,21 @@ impl LogWriter {
         };
         line.push(b'\n');
 
-        if let Ok(mut guard) = self.inner.lock()
-            && let Err(err) = guard.write(&line)
-        {
-            tracing::warn!(error = %err, "exec_log: write failed");
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Err(err) = guard.write(&line) {
+                tracing::warn!(error = %err, "exec_log: write failed");
+            }
+            // Once per failure episode; the entry above was still written.
+            match guard.take_rotation_event() {
+                Some(crate::logging::RotationEvent::Failed(err)) => tracing::warn!(
+                    error = %err,
+                    "exec_log: cannot rotate exec.log; it keeps growing and the rotation is retried"
+                ),
+                Some(crate::logging::RotationEvent::Recovered) => {
+                    tracing::info!("exec_log: exec.log rotates again after an earlier failure");
+                }
+                None => {}
+            }
         }
     }
 }
