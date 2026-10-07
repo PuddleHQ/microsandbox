@@ -3187,6 +3187,8 @@ fn prepare_runtime_restore_namespace(runtime_dir: &Path, oci_root: bool) -> Runt
 /// root protection as a `--mount`: a symlink at or under the rootfs path is
 /// refused rather than followed out of its intended target. `follow_root_symlinks`
 /// opts out when the host rootfs path legitimately traverses a symlink.
+///
+/// A root that has no `dev` directory gets one (see [`ensure_bind_root_dev`]).
 fn bind_rootfs_backend(
     rootfs_path: &Path,
     follow_root_symlinks: bool,
@@ -3198,7 +3200,31 @@ fn bind_rootfs_backend(
         no_symlink_root: !follow_root_symlinks,
         ..Default::default()
     };
-    PassthroughFs::new(cfg).map_err(|e| RuntimeError::Custom(format!("rootfs: {e}")))
+    let backend =
+        PassthroughFs::new(cfg).map_err(|e| RuntimeError::Custom(format!("rootfs: {e}")))?;
+    ensure_bind_root_dev(rootfs_path);
+    Ok(backend)
+}
+
+/// Creates `dev` in a host-directory rootfs that lacks it, as the bootstrap roots have it
+/// ([`BOOTSTRAP_MOUNTPOINTS`]). The kernel mounts devtmpfs on `/dev` before PID 1 runs, so
+/// `/dev/null` exists even when the kernel could not give PID 1 a console (the virtio-console
+/// port can arrive after `console_on_rootfs()` under host load); without `/dev` that mount fails
+/// ("devtmpfs: error mounting -2"), agentd starts with fds 0-2 closed, Rust's runtime finds no
+/// `/dev/null` for them and aborts before `main`, and the VM exits 0 before the agent relay.
+///
+/// agentd itself creates `/dev` in this root (`mkdir_ignore_exists`) on every boot, through the
+/// same share, so this only does it earlier. An existing entry of any kind (a directory, file or
+/// symlink) is left alone, and a failure is logged, not fatal: the boot then behaves as before.
+fn ensure_bind_root_dev(rootfs_path: &Path) {
+    let dev = rootfs_path.join("dev");
+    match std::fs::create_dir(&dev) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            tracing::warn!(path = %dev.display(), %error, "could not create /dev in the bind rootfs");
+        }
+    }
 }
 
 /// Canonicalize a microsandbox-owned mount root so it is symlink-free.
@@ -3949,7 +3975,7 @@ mod tests {
     use super::{
         AGENT_BULK_QUEUE_SIZE, AGENT_CONTROL_QUEUE_SIZE, AgentTransportProfile, ConsoleSharedState,
         HostPermissions, StatVirtualization, agent_kernel_cmdline, agent_primary_queue_size,
-        append_block_root_env, bind_rootfs_backend, encode_bootstrap_frame,
+        append_block_root_env, bind_rootfs_backend, encode_bootstrap_frame, ensure_bind_root_dev,
         guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override, parse_mount_spec,
         prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
         thp_kernel_cmdline, validate_disk_format,
@@ -4282,6 +4308,54 @@ mod tests {
 
         assert_ne!(host.inode, init.inode);
         assert_eq!(init.inode, 2);
+    }
+
+    #[test]
+    fn test_bind_rootfs_without_dev_gets_one_before_boot() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::write(rootfs.path().join("probe"), b"\x7fELF").unwrap();
+
+        let fs = bind_rootfs_backend(rootfs.path(), true, msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES).unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        // devtmpfs needs /dev before PID 1 runs.
+        assert!(rootfs.path().join("dev").is_dir());
+        assert_eq!(
+            std::fs::read_dir(rootfs.path().join("dev"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fs.lookup(fs_context(), 1, c"dev").unwrap();
+    }
+
+    #[test]
+    fn test_bind_rootfs_keeps_an_existing_dev_entry() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(rootfs.path().join("dev")).unwrap();
+        std::fs::write(rootfs.path().join("dev/keep"), b"image").unwrap();
+        ensure_bind_root_dev(rootfs.path());
+        assert_eq!(
+            std::fs::read(rootfs.path().join("dev/keep")).unwrap(),
+            b"image"
+        );
+
+        // A file named dev is the image's business: left as it is, and no error.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("dev"), b"not a dir").unwrap();
+        ensure_bind_root_dev(other.path());
+        assert_eq!(
+            std::fs::read(other.path().join("dev")).unwrap(),
+            b"not a dir"
+        );
+    }
+
+    #[test]
+    fn test_bind_rootfs_that_is_refused_gets_no_dev() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing");
+        assert!(bind_rootfs_backend(&missing, true, msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES).is_err());
+        assert!(!missing.exists());
     }
 
     #[cfg(unix)]
