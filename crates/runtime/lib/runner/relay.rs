@@ -35,7 +35,8 @@ use microsandbox_protocol::AGENT_RELAY_MAX_CLIENTS;
 use microsandbox_protocol::bulk::BulkRecord;
 use microsandbox_protocol::bulk::{
     BULK_FLOW_MASK_GUEST_TO_HOST, BULK_HEADER_SIZE, BulkAccepted, BulkCancel, BulkCancelReason,
-    BulkCredit, BulkFinish, BulkFlow, BulkKind, MAX_BULK_RECORD_PAYLOAD, MAX_BULK_WINDOW,
+    BulkCredit, BulkFinish, BulkFlow, BulkKind, MAX_BULK_FLOWS_PER_CLIENT, MAX_BULK_RECORD_PAYLOAD,
+    MAX_BULK_WINDOW, bulk_flow_limit_error,
 };
 use microsandbox_protocol::codec::{self, MAX_FRAME_SIZE, MAX_WIRE_FRAME};
 #[cfg(test)]
@@ -181,8 +182,9 @@ const BULK_WRITE_QUANTUM: usize = 256 * 1024;
 /// Maximum bytes one correlation may write in one bulk scheduling round.
 const BULK_WRITE_MAX_BURST: usize = MAX_BULK_RECORD_PAYLOAD as usize;
 
-/// Maximum concurrently queued flows from one relay client.
-const BULK_WRITE_MAX_FLOWS_PER_CLIENT: usize = 64;
+/// Maximum concurrently queued flows from one relay client. Memory stays bounded by the aggregate
+/// byte budgets above (and the guest's matching ones), not by this count.
+const BULK_WRITE_MAX_FLOWS_PER_CLIENT: usize = MAX_BULK_FLOWS_PER_CLIENT;
 
 /// Maximum out-of-order records retained for one guest-to-host bulk flow.
 const BULK_MERGE_MAX_PENDING_RECORDS: usize = 1024;
@@ -4518,9 +4520,7 @@ fn queue_bulk_open_rejection(
     id: u32,
     kind: BulkKind,
 ) -> RuntimeResult<()> {
-    let error = format!(
-        "client already has the maximum of {BULK_WRITE_MAX_FLOWS_PER_CLIENT} active bulk operations"
-    );
+    let error = bulk_flow_limit_error(BULK_WRITE_MAX_FLOWS_PER_CLIENT);
     let mut message = match kind {
         BulkKind::Filesystem => Message::with_payload(
             MessageType::FsResponse,
@@ -9044,7 +9044,21 @@ mod tests {
             assert_eq!(message.id, id);
             assert_eq!(message.t, expected_type);
             assert_eq!(message.flags, FLAG_TERMINAL);
+            if kind == BulkKind::Tcp {
+                // The SDK retries an open that fails with exactly this text.
+                let failed: TcpFailed = message.payload().unwrap();
+                assert!(microsandbox_protocol::bulk::is_bulk_flow_limit_error(
+                    &failed.error
+                ));
+                assert!(failed.error.contains(" 256 "), "{}", failed.error);
+            }
         }
+    }
+
+    #[test]
+    fn per_client_flow_limit_is_the_shared_protocol_value() {
+        assert_eq!(BULK_WRITE_MAX_FLOWS_PER_CLIENT, MAX_BULK_FLOWS_PER_CLIENT);
+        assert_eq!(BULK_WRITE_MAX_FLOWS_PER_CLIENT, 256);
     }
 
     #[derive(Default)]

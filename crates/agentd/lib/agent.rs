@@ -20,7 +20,7 @@ use microsandbox_protocol::bootstrap::GuestBootstrap;
 use microsandbox_protocol::bulk::{
     BULK_HEADER_SIZE, BULK_PROTOCOL_VERSION, BulkCancel, BulkCancelReason, BulkCredit, BulkFinish,
     BulkFlow, BulkKind, BulkRecord, DEFAULT_BULK_WINDOW, DEFAULT_FILESYSTEM_BULK_RECORD_PAYLOAD,
-    MAX_BULK_RECORD_PAYLOAD, MIN_BULK_RECORD_PAYLOAD,
+    MAX_BULK_FLOWS_PER_CLIENT, MAX_BULK_RECORD_PAYLOAD, MIN_BULK_RECORD_PAYLOAD,
 };
 use microsandbox_protocol::codec::{self, DecodedFrame, MAX_FRAME_SIZE};
 use microsandbox_protocol::core::{
@@ -111,8 +111,9 @@ const BULK_SCHEDULER_MAX_BURST: usize = MAX_BULK_RECORD_PAYLOAD as usize;
 /// Maximum bytes queued for one correlation outside the console backend.
 const BULK_SCHEDULER_FLOW_CAPACITY: usize = 8 * 1024 * 1024;
 
-/// Maximum active bulk correlations owned by one relay client.
-const BULK_SCHEDULER_MAX_FLOWS_PER_CLIENT: usize = 64;
+/// Maximum active bulk correlations owned by one relay client. The aggregate output budget
+/// (`SESSION_OUTPUT_BYTE_CAPACITY`) bounds the memory behind them, not this count.
+const BULK_SCHEDULER_MAX_FLOWS_PER_CLIENT: usize = MAX_BULK_FLOWS_PER_CLIENT;
 
 /// Whole records processed before the bulk reader yields on a one-vCPU guest.
 const BULK_READER_MAX_RECORDS_PER_TURN: usize = 64;
@@ -5613,6 +5614,72 @@ mod tests {
         assert!(flows.is_empty());
         assert!(active.is_empty());
         assert!(bulk_output_is_retired(&retired, incarnation, 17));
+    }
+
+    #[tokio::test]
+    async fn bulk_output_admits_the_shared_per_client_flow_limit_and_no_more() {
+        let incarnation = [0x33; CLIENT_INCARNATION_SIZE];
+        let (session_tx, _control_rx, mut bulk_rx, _command_rx) =
+            SessionOutputSender::split_channel();
+        let owner_tx = session_tx.with_incarnation(Some(incarnation));
+        let mut flows = HashMap::new();
+        let mut active = VecDeque::new();
+        let retired = HashMap::new();
+        let retiring_incarnations = HashSet::new();
+
+        let enqueue = |id: u32| {
+            let tx = owner_tx.clone();
+            let record = BulkRecord {
+                id,
+                kind: BulkKind::Tcp,
+                flow: BulkFlow::GuestToHost,
+                offset: 0,
+                payload: bytes::Bytes::from_static(b"x"),
+            };
+            async move {
+                assert!(
+                    tx.send(
+                        id,
+                        SessionOutput::Bulk(crate::session::BulkSessionOutput::new(
+                            record,
+                            RawActivity::default(),
+                        )),
+                    )
+                    .await
+                );
+            }
+        };
+        for id in 1..=MAX_BULK_FLOWS_PER_CLIENT as u32 {
+            enqueue(id).await;
+            enqueue_bulk_output(
+                bulk_rx.recv().await.unwrap(),
+                0,
+                &mut flows,
+                &mut active,
+                &retired,
+                &retiring_incarnations,
+            )
+            .unwrap();
+        }
+        assert_eq!(flows.len(), MAX_BULK_FLOWS_PER_CLIENT);
+        assert_eq!(BULK_SCHEDULER_MAX_FLOWS_PER_CLIENT, 256);
+
+        let over = MAX_BULK_FLOWS_PER_CLIENT as u32 + 1;
+        enqueue(over).await;
+        let error = enqueue_bulk_output(
+            bulk_rx.recv().await.unwrap(),
+            0,
+            &mut flows,
+            &mut active,
+            &retired,
+            &retiring_incarnations,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("active bulk-flow limit"),
+            "{error}"
+        );
+        assert_eq!(flows.len(), MAX_BULK_FLOWS_PER_CLIENT);
     }
 
     #[test]

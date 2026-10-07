@@ -39,6 +39,17 @@ pub const DEFAULT_BULK_WINDOW: u64 = 8 * 1024 * 1024;
 /// Largest receive window generation 8 permits.
 pub const MAX_BULK_WINDOW: u64 = 32 * 1024 * 1024;
 
+/// Most bulk flows (TCP forwards and file transfers) one relay client may have active at once.
+///
+/// Both ends enforce it: the host relay refuses the open that would exceed it, and the guest agent
+/// stops scheduling output for a client above it. They must agree, so they share this value. The
+/// memory behind the flows is bounded by aggregate byte budgets, not by this count.
+pub const MAX_BULK_FLOWS_PER_CLIENT: usize = 256;
+
+/// Start of the error text for an open refused because the client is at
+/// [`MAX_BULK_FLOWS_PER_CLIENT`].
+const BULK_FLOW_LIMIT_ERROR_PREFIX: &str = "client already has the maximum of ";
+
 /// Flow-mask bit for host-to-guest data.
 pub const BULK_FLOW_MASK_HOST_TO_GUEST: u8 = 0b01;
 
@@ -699,12 +710,53 @@ fn validate_payload_len(length: usize, max: u32) -> Result<(), BulkStateError> {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Error text for a bulk open refused because the client already has `limit` flows active.
+pub fn bulk_flow_limit_error(limit: usize) -> String {
+    format!("{BULK_FLOW_LIMIT_ERROR_PREFIX}{limit} active bulk operations")
+}
+
+/// Whether `error` is the refusal [`bulk_flow_limit_error`] produces.
+///
+/// The refusal is transient: a slot frees as soon as an active flow ends, so a caller may retry.
+/// Any other failure of an open (a refused connection, a timeout) is not.
+pub fn is_bulk_flow_limit_error(error: &str) -> bool {
+    error.starts_with(BULK_FLOW_LIMIT_ERROR_PREFIX) && error.ends_with(" active bulk operations")
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_limit_error_is_recognised_for_every_limit() {
+        for limit in [1, 64, MAX_BULK_FLOWS_PER_CLIENT] {
+            assert!(is_bulk_flow_limit_error(&bulk_flow_limit_error(limit)));
+        }
+        assert_eq!(
+            bulk_flow_limit_error(256),
+            "client already has the maximum of 256 active bulk operations"
+        );
+    }
+
+    #[test]
+    fn other_open_failures_are_not_flow_limit_errors() {
+        for error in [
+            "",
+            "connection refused",
+            "connect timed out",
+            "relay client exceeded active bulk-flow limit for correlation 7",
+            "the client already has the maximum of 64 active bulk operations",
+        ] {
+            assert!(!is_bulk_flow_limit_error(error), "{error}");
+        }
+    }
 
     #[test]
     fn default_offers_keep_filesystem_throughput_and_tcp_latency_granularity() {

@@ -1,6 +1,7 @@
 //! SSH client and server helpers for sandboxes.
 
 use std::collections::HashMap;
+use std::future::Future;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use microsandbox_protocol::{
     bulk::{
         BULK_FLOW_MASK_GUEST_TO_HOST, BULK_FLOW_MASK_HOST_TO_GUEST, BulkCancel, BulkCancelReason,
         BulkCredit, BulkFinish, BulkFlow, BulkKind, BulkOffer, BulkReceiveState, BulkRecord,
-        BulkSendState,
+        BulkSendState, is_bulk_flow_limit_error,
     },
     fs::{
         FS_CHUNK_SIZE, FsEntryInfo, FsOp, FsOpenOptions, FsRequest, FsResponse, FsResponseData,
@@ -75,6 +76,14 @@ const SSH_TCP_PACKET_BYTES: usize = 32 * 1024;
 /// Mirrors agentd's largest session-output item queue. The negotiated receive window bounds raw
 /// bytes; this item bound lets control credits pass while russh waits for the peer's output window.
 const TCP_OUTPUT_QUEUE_CAPACITY: usize = 1024;
+
+/// How long a `direct-tcpip` open that hits the relay's per-client flow limit keeps retrying
+/// before the channel is refused. Slots free as soon as a flow ends, and a flow whose guest end
+/// lingers after the client closed it can hold one for several seconds.
+const TCP_FORWARD_CAP_RETRY_WINDOW: Duration = Duration::from_secs(10);
+
+/// Pause between retries of a `direct-tcpip` open refused for the flow limit.
+const TCP_FORWARD_CAP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -203,23 +212,33 @@ struct SshSession {
     client: Option<Arc<AgentClient>>,
     user: Option<String>,
     channels: HashMap<ChannelId, ChannelState>,
+    /// Channels opened by `pending_opens`, not yet adopted into `channels`.
+    deferred: DeferredChannels,
+    /// Opens waiting for a free flow slot. They run off the session loop, which must keep
+    /// processing the closes that free those slots; dropping the set cancels them.
+    pending_opens: tokio::task::JoinSet<()>,
 }
 
 impl Drop for SshSession {
     fn drop(&mut self) {
-        for state in self.channels.values() {
-            if let ChannelState::Tcp {
-                input,
-                output,
-                relay,
-                ..
-            } = state
-            {
-                input.abort();
-                output.abort();
-                relay.abort();
-            }
+        self.pending_opens.abort_all();
+        for state in self.channels.values().chain(self.deferred.close().iter()) {
+            abort_tcp_tasks(state);
         }
+    }
+}
+
+fn abort_tcp_tasks(state: &ChannelState) {
+    if let ChannelState::Tcp {
+        input,
+        output,
+        relay,
+        ..
+    } = state
+    {
+        input.abort();
+        output.abort();
+        relay.abort();
     }
 }
 
@@ -1193,6 +1212,8 @@ impl SshSession {
             client: None,
             user: None,
             channels: HashMap::new(),
+            deferred: DeferredChannels::new(),
+            pending_opens: tokio::task::JoinSet::new(),
         }
     }
 
@@ -1321,18 +1342,17 @@ impl SshSession {
         Ok(())
     }
 
-    /// Opens the guest TCP connection for a `direct-tcpip` channel. A refusal carries the reason
-    /// for the channel-open failure: only an invalid or unsupported request is "administratively
-    /// prohibited"; a guest connect that fails is "connect failed", as in OpenSSH.
-    async fn start_tcp_forward(
+    /// Checks a `direct-tcpip` request and returns the agent client that will carry it. A refusal
+    /// carries the reason for the channel-open failure: only an invalid or unsupported request is
+    /// "administratively prohibited"; a guest connect that fails is "connect failed", as in
+    /// OpenSSH.
+    async fn tcp_forward_client(
         &mut self,
-        channel: Channel<Msg>,
         host_to_connect: &str,
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
-        session: &mut Session,
-    ) -> anyhow::Result<Result<(), ChannelOpenFailure>> {
+    ) -> anyhow::Result<Result<Arc<AgentClient>, ChannelOpenFailure>> {
         if host_to_connect.is_empty() || port_to_connect > u16::MAX as u32 {
             tracing::warn!(
                 host = host_to_connect,
@@ -1352,157 +1372,320 @@ impl SshSession {
             );
             return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
         }
+        Ok(Ok(client))
+    }
 
-        let channel_id = channel.id();
-        let req = TcpConnect {
-            host: host_to_connect.to_string(),
-            port: port_to_connect as u16,
-            bulk: client
-                .supports(MessageType::BulkAccepted)
-                .then(BulkOffer::tcp),
-        };
-        let (tcp_id, mut tcp_rx) = client.stream_frames(MessageType::TcpConnect, &req).await?;
-        let Some(first) = tcp_rx.recv().await else {
+    /// Moves the channels that finished opening off the session loop into `channels`. Every
+    /// callback that looks a channel up calls this first: a deferred open deposits its state
+    /// before it confirms the channel, so any callback for a confirmed channel finds it.
+    fn adopt_deferred_channels(&mut self) {
+        self.deferred.drain_into(&mut self.channels);
+    }
+}
+/// Result of one attempt to open a guest TCP connection for a `direct-tcpip` channel.
+enum TcpAttempt {
+    /// The guest connected; the channel's relay tasks run.
+    Connected(ChannelState),
+    /// The relay refused the open because the client is at its active-flow limit. The channel is
+    /// handed back untouched: the refusal clears when any active flow ends.
+    CapReached(Channel<Msg>),
+    /// The open failed for a reason a retry won't change.
+    Refused(ChannelOpenFailure),
+}
+
+/// Opens the guest TCP connection for one `direct-tcpip` channel and starts its relay tasks.
+async fn open_tcp_forward(
+    client: Arc<AgentClient>,
+    channel: Channel<Msg>,
+    session_handle: russh::server::Handle,
+    host_to_connect: &str,
+    port_to_connect: u32,
+) -> anyhow::Result<TcpAttempt> {
+    let channel_id = channel.id();
+    let req = TcpConnect {
+        host: host_to_connect.to_string(),
+        port: port_to_connect as u16,
+        bulk: client
+            .supports(MessageType::BulkAccepted)
+            .then(BulkOffer::tcp),
+    };
+    let (tcp_id, mut tcp_rx) = client.stream_frames(MessageType::TcpConnect, &req).await?;
+    let Some(first) = tcp_rx.recv().await else {
+        tracing::debug!(
+            host = host_to_connect,
+            port = port_to_connect,
+            "ssh direct-tcpip rejected because agent stream closed before connect reply"
+        );
+        return Ok(TcpAttempt::Refused(
+            ChannelOpenFailure::AdministrativelyProhibited,
+        ));
+    };
+
+    let AgentFrame::Control(first) = first else {
+        tracing::warn!(
+            host = host_to_connect,
+            port = port_to_connect,
+            "ssh direct-tcpip received raw data before connect reply"
+        );
+        return Ok(TcpAttempt::Refused(
+            ChannelOpenFailure::AdministrativelyProhibited,
+        ));
+    };
+    match first.t {
+        MessageType::TcpConnected => {
+            let _: TcpConnected = first.payload()?;
+            let (bulk_sender, bulk_receiver) = match req.bulk {
+                Some(offer) => {
+                    let Some(AgentFrame::Control(accepted_message)) = tcp_rx.recv().await else {
+                        tracing::warn!(
+                            host = host_to_connect,
+                            port = port_to_connect,
+                            "ssh direct-tcpip stream closed before bulk acceptance"
+                        );
+                        return Ok(TcpAttempt::Refused(
+                            ChannelOpenFailure::AdministrativelyProhibited,
+                        ));
+                    };
+                    if accepted_message.t != MessageType::BulkAccepted {
+                        tracing::warn!(
+                            host = host_to_connect,
+                            port = port_to_connect,
+                            message_type = accepted_message.t.as_str(),
+                            "ssh direct-tcpip received unexpected bulk negotiation reply"
+                        );
+                        return Ok(TcpAttempt::Refused(
+                            ChannelOpenFailure::AdministrativelyProhibited,
+                        ));
+                    }
+                    let accepted =
+                        accepted_message.payload::<microsandbox_protocol::bulk::BulkAccepted>()?;
+                    let accepted = accepted
+                        .validate_against(
+                            offer,
+                            BulkKind::Tcp,
+                            BULK_FLOW_MASK_HOST_TO_GUEST | BULK_FLOW_MASK_GUEST_TO_HOST,
+                        )
+                        .map_err(|error| {
+                            MicrosandboxError::Custom(format!(
+                                "invalid TCP bulk acceptance: {error}"
+                            ))
+                        })?;
+                    let sender = BulkSendState::new(
+                        BulkKind::Tcp,
+                        BulkFlow::HostToGuest,
+                        accepted.max_record_payload,
+                        accepted.host_to_guest_credit_limit,
+                    )
+                    .map_err(|error| {
+                        MicrosandboxError::Custom(format!("create TCP bulk send state: {error}"))
+                    })?;
+                    let receiver = BulkReceiveState::new(
+                        BulkKind::Tcp,
+                        BulkFlow::GuestToHost,
+                        accepted.max_record_payload,
+                        accepted.guest_to_host_credit_limit,
+                        offer.guest_to_host_credit_limit,
+                    )
+                    .map_err(|error| {
+                        MicrosandboxError::Custom(format!("create TCP bulk receive state: {error}"))
+                    })?;
+                    (Some(Arc::new(TcpBulkSender::new(sender))), Some(receiver))
+                }
+                None => (None, None),
+            };
+            let bulk_receiver = bulk_receiver.map(|receiver| Arc::new(Mutex::new(receiver)));
+            // Russh already routes channel data into this independent stream before invoking
+            // the handler callbacks. Reading it in a dedicated task means waiting on agent
+            // credit never blocks the session loop that must process reverse window updates.
+            let (channel_reader, channel_writer) = tokio::io::split(channel.into_stream());
+            let input = tokio::spawn(relay_ssh_to_tcp(
+                channel_id,
+                tcp_id,
+                channel_reader,
+                session_handle.clone(),
+                Arc::clone(&client),
+                bulk_sender.as_ref().map(Arc::clone),
+            ));
+            let (output_tx, output_rx) = mpsc::channel(TCP_OUTPUT_QUEUE_CAPACITY);
+            let output = tokio::spawn(relay_tcp_output_to_ssh(
+                channel_id,
+                tcp_id,
+                output_rx,
+                channel_writer,
+                session_handle.clone(),
+                Arc::clone(&client),
+                bulk_receiver.as_ref().map(Arc::clone),
+            ));
+            let relay_sender = bulk_sender.as_ref().map(Arc::clone);
+            let relay = tokio::spawn(async move {
+                relay_tcp_to_ssh(tcp_rx, output_tx, relay_sender, bulk_receiver).await;
+            });
+            Ok(TcpAttempt::Connected(ChannelState::Tcp {
+                id: tcp_id,
+                client,
+                bulk: bulk_sender,
+                input,
+                output,
+                relay,
+            }))
+        }
+        MessageType::TcpFailed => {
+            let failed: TcpFailed = first.payload()?;
+            if is_bulk_flow_limit_error(&failed.error) {
+                return Ok(TcpAttempt::CapReached(channel));
+            }
             tracing::debug!(
                 host = host_to_connect,
                 port = port_to_connect,
-                "ssh direct-tcpip rejected because agent stream closed before connect reply"
+                error = failed.error,
+                "ssh direct-tcpip rejected because guest TCP connect failed"
             );
-            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
-        };
-
-        let AgentFrame::Control(first) = first else {
+            Ok(TcpAttempt::Refused(ChannelOpenFailure::ConnectFailed))
+        }
+        other => {
             tracing::warn!(
                 host = host_to_connect,
                 port = port_to_connect,
-                "ssh direct-tcpip received raw data before connect reply"
+                message_type = other.as_str(),
+                "ssh direct-tcpip rejected unexpected agent reply"
             );
-            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
-        };
-        match first.t {
-            MessageType::TcpConnected => {
-                let _: TcpConnected = first.payload()?;
-                let (bulk_sender, bulk_receiver) = match req.bulk {
-                    Some(offer) => {
-                        let Some(AgentFrame::Control(accepted_message)) = tcp_rx.recv().await
-                        else {
-                            tracing::warn!(
-                                host = host_to_connect,
-                                port = port_to_connect,
-                                "ssh direct-tcpip stream closed before bulk acceptance"
-                            );
-                            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
-                        };
-                        if accepted_message.t != MessageType::BulkAccepted {
-                            tracing::warn!(
-                                host = host_to_connect,
-                                port = port_to_connect,
-                                message_type = accepted_message.t.as_str(),
-                                "ssh direct-tcpip received unexpected bulk negotiation reply"
-                            );
-                            return Ok(Err(ChannelOpenFailure::AdministrativelyProhibited));
-                        }
-                        let accepted = accepted_message
-                            .payload::<microsandbox_protocol::bulk::BulkAccepted>()?;
-                        let accepted = accepted
-                            .validate_against(
-                                offer,
-                                BulkKind::Tcp,
-                                BULK_FLOW_MASK_HOST_TO_GUEST | BULK_FLOW_MASK_GUEST_TO_HOST,
-                            )
-                            .map_err(|error| {
-                                MicrosandboxError::Custom(format!(
-                                    "invalid TCP bulk acceptance: {error}"
-                                ))
-                            })?;
-                        let sender = BulkSendState::new(
-                            BulkKind::Tcp,
-                            BulkFlow::HostToGuest,
-                            accepted.max_record_payload,
-                            accepted.host_to_guest_credit_limit,
-                        )
-                        .map_err(|error| {
-                            MicrosandboxError::Custom(format!(
-                                "create TCP bulk send state: {error}"
-                            ))
-                        })?;
-                        let receiver = BulkReceiveState::new(
-                            BulkKind::Tcp,
-                            BulkFlow::GuestToHost,
-                            accepted.max_record_payload,
-                            accepted.guest_to_host_credit_limit,
-                            offer.guest_to_host_credit_limit,
-                        )
-                        .map_err(|error| {
-                            MicrosandboxError::Custom(format!(
-                                "create TCP bulk receive state: {error}"
-                            ))
-                        })?;
-                        (Some(Arc::new(TcpBulkSender::new(sender))), Some(receiver))
-                    }
-                    None => (None, None),
-                };
-                let bulk_receiver = bulk_receiver.map(|receiver| Arc::new(Mutex::new(receiver)));
-                let session_handle = session.handle();
-                // Russh already routes channel data into this independent stream before invoking
-                // the handler callbacks. Reading it in a dedicated task means waiting on agent
-                // credit never blocks the session loop that must process reverse window updates.
-                let (channel_reader, channel_writer) = tokio::io::split(channel.into_stream());
-                let input = tokio::spawn(relay_ssh_to_tcp(
-                    channel_id,
-                    tcp_id,
-                    channel_reader,
-                    session_handle.clone(),
-                    Arc::clone(&client),
-                    bulk_sender.as_ref().map(Arc::clone),
-                ));
-                let (output_tx, output_rx) = mpsc::channel(TCP_OUTPUT_QUEUE_CAPACITY);
-                let output = tokio::spawn(relay_tcp_output_to_ssh(
-                    channel_id,
-                    tcp_id,
-                    output_rx,
-                    channel_writer,
-                    session_handle.clone(),
-                    Arc::clone(&client),
-                    bulk_receiver.as_ref().map(Arc::clone),
-                ));
-                let relay_sender = bulk_sender.as_ref().map(Arc::clone);
-                let relay = tokio::spawn(async move {
-                    relay_tcp_to_ssh(tcp_rx, output_tx, relay_sender, bulk_receiver).await;
-                });
-                self.channels.insert(
-                    channel_id,
-                    ChannelState::Tcp {
-                        id: tcp_id,
-                        client,
-                        bulk: bulk_sender,
-                        input,
-                        output,
-                        relay,
-                    },
-                );
-                Ok(Ok(()))
-            }
-            MessageType::TcpFailed => {
-                let failed: TcpFailed = first.payload()?;
-                tracing::debug!(
-                    host = host_to_connect,
-                    port = port_to_connect,
-                    error = failed.error,
-                    "ssh direct-tcpip rejected because guest TCP connect failed"
-                );
-                Ok(Err(ChannelOpenFailure::ConnectFailed))
-            }
-            other => {
-                tracing::warn!(
-                    host = host_to_connect,
-                    port = port_to_connect,
-                    message_type = other.as_str(),
-                    "ssh direct-tcpip rejected unexpected agent reply"
-                );
-                Ok(Err(ChannelOpenFailure::AdministrativelyProhibited))
-            }
+            Ok(TcpAttempt::Refused(
+                ChannelOpenFailure::AdministrativelyProhibited,
+            ))
         }
+    }
+}
+
+/// Retries a capped `direct-tcpip` open until a slot frees or the retry window ends, then answers
+/// the channel-open request.
+async fn finish_deferred_open(
+    deferred: DeferredChannels,
+    client: Arc<AgentClient>,
+    channel: Channel<Msg>,
+    session_handle: russh::server::Handle,
+    host: String,
+    port: u32,
+    reply: ChannelOpenHandle,
+) {
+    let channel_id = channel.id();
+    let retried = retry_while_capped(
+        TCP_FORWARD_CAP_RETRY_WINDOW,
+        TCP_FORWARD_CAP_RETRY_INTERVAL,
+        channel,
+        |channel| {
+            let client = Arc::clone(&client);
+            let session_handle = session_handle.clone();
+            let host = host.clone();
+            async move {
+                match open_tcp_forward(client, channel, session_handle, &host, port).await? {
+                    TcpAttempt::Connected(state) => Ok(Ok(Ok(state))),
+                    TcpAttempt::Refused(reason) => Ok(Ok(Err(reason))),
+                    TcpAttempt::CapReached(channel) => Ok(Err(channel)),
+                }
+            }
+        },
+    )
+    .await;
+    match retried {
+        Ok(Ok(Ok(state))) => match deferred.deposit(channel_id, state) {
+            Ok(()) => reply.accept().await,
+            Err(state) => {
+                // The session ended while this open was in flight: nothing will adopt the channel.
+                abort_tcp_tasks(&state);
+                if let ChannelState::Tcp { id, client, .. } = state {
+                    let _ = client.send(id, MessageType::TcpClose, &TcpClose {}).await;
+                    client.forget_stream(id).await;
+                }
+            }
+        },
+        Ok(Ok(Err(reason))) => reply.reject(reason).await,
+        Ok(Err(_capped)) => {
+            tracing::debug!(
+                host,
+                port,
+                "ssh direct-tcpip rejected because the client stayed at its active flow limit"
+            );
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+        }
+        Err(error) => {
+            tracing::warn!(host, port, %error, "ssh direct-tcpip open failed");
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+        }
+    }
+}
+
+/// Runs `attempt` until it stops reporting a capped open or `window` has passed, pausing
+/// `interval` between attempts. `Ok(Err(capped))` is the last capped result.
+async fn retry_while_capped<Done, Capped, Fut>(
+    window: Duration,
+    interval: Duration,
+    mut capped: Capped,
+    mut attempt: impl FnMut(Capped) -> Fut,
+) -> anyhow::Result<Result<Done, Capped>>
+where
+    Fut: Future<Output = anyhow::Result<Result<Done, Capped>>>,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(Err(capped));
+        }
+        tokio::time::sleep(interval.min(deadline - now)).await;
+        match attempt(capped).await? {
+            Ok(done) => return Ok(Ok(done)),
+            Err(again) => capped = again,
+        }
+    }
+}
+
+/// Channels whose open outlived the session callback that started it. The task that finishes one
+/// deposits its state here before confirming the channel; the session adopts it on its next
+/// callback. Closing it hands every deposited state back to be torn down.
+type DeferredChannels = Mailbox<ChannelId, ChannelState>;
+
+/// A set of finished items waiting to be adopted by their owner, shared with the tasks that make
+/// them. After `close` it takes nothing more.
+struct Mailbox<K, V>(Arc<std::sync::Mutex<Option<HashMap<K, V>>>>);
+
+impl<K, V> Clone for Mailbox<K, V> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V> Mailbox<K, V> {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(HashMap::new()))))
+    }
+
+    /// Stores an item, or returns it when the mailbox is already closed.
+    fn deposit(&self, key: K, value: V) -> Result<(), V> {
+        match self.0.lock().unwrap().as_mut() {
+            Some(items) => {
+                items.insert(key, value);
+                Ok(())
+            }
+            None => Err(value),
+        }
+    }
+
+    fn drain_into(&self, target: &mut HashMap<K, V>) {
+        if let Some(items) = self.0.lock().unwrap().as_mut() {
+            target.extend(items.drain());
+        }
+    }
+
+    /// Refuses later deposits and returns the items nobody adopted.
+    fn close(&self) -> Vec<V> {
+        self.0
+            .lock()
+            .unwrap()
+            .take()
+            .map(|items| items.into_values().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1562,19 +1745,59 @@ impl russh::server::Handler for SshSession {
         reply: ChannelOpenHandle,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let result = self
-            .start_tcp_forward(
-                channel,
+        let channel_id = channel.id();
+        let client = match self
+            .tcp_forward_client(
                 host_to_connect,
                 port_to_connect,
                 originator_address,
                 originator_port,
-                session,
             )
-            .await?;
-        match result {
-            Ok(()) => reply.accept().await,
-            Err(reason) => reply.reject(reason).await,
+            .await?
+        {
+            Ok(client) => client,
+            Err(reason) => {
+                reply.reject(reason).await;
+                return Ok(());
+            }
+        };
+        let session_handle = session.handle();
+        let attempt = open_tcp_forward(
+            Arc::clone(&client),
+            channel,
+            session_handle.clone(),
+            host_to_connect,
+            port_to_connect,
+        )
+        .await?;
+        match attempt {
+            TcpAttempt::Connected(state) => {
+                self.channels.insert(channel_id, state);
+                reply.accept().await;
+            }
+            TcpAttempt::Refused(reason) => reply.reject(reason).await,
+            TcpAttempt::CapReached(channel) => {
+                tracing::debug!(
+                    host = host_to_connect,
+                    port = port_to_connect,
+                    "ssh direct-tcpip waiting for a free flow slot"
+                );
+                while self.pending_opens.try_join_next().is_some() {}
+                let deferred = self.deferred.clone();
+                let host = host_to_connect.to_string();
+                self.pending_opens.spawn(async move {
+                    finish_deferred_open(
+                        deferred,
+                        client,
+                        channel,
+                        session_handle,
+                        host,
+                        port_to_connect,
+                        reply,
+                    )
+                    .await;
+                });
+            }
         }
         Ok(())
     }
@@ -1706,6 +1929,7 @@ impl russh::server::Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.adopt_deferred_channels();
         // Direct-TCP data is consumed from the `ChannelStream` installed at channel-open time.
         // Russh mirrors it there before this callback, so doing work here would duplicate bytes
         // and, more importantly, couple agent backpressure to the SSH session loop.
@@ -1727,6 +1951,7 @@ impl russh::server::Handler for SshSession {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.adopt_deferred_channels();
         // The channel stream observes EOF independently of the callback path.
         if matches!(self.channels.get(&channel), Some(ChannelState::Tcp { .. })) {
             return Ok(());
@@ -1756,6 +1981,7 @@ impl russh::server::Handler for SshSession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.adopt_deferred_channels();
         match self.channels.remove(&channel) {
             Some(ChannelState::Tcp {
                 id,
@@ -3406,6 +3632,97 @@ mod tests {
         })
         .await
         .expect("SSH missing-outcome round trip timed out");
+    }
+
+    #[tokio::test]
+    async fn capped_open_retries_until_the_cap_clears() {
+        let mut attempts = 0;
+        let result = retry_while_capped(
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            "channel",
+            |channel| {
+                attempts += 1;
+                let cleared = attempts == 4;
+                async move {
+                    Ok(if cleared {
+                        Ok(format!("opened {channel}"))
+                    } else {
+                        Err(channel)
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "opened channel");
+        assert_eq!(attempts, 4);
+    }
+
+    #[tokio::test]
+    async fn capped_open_gives_the_channel_back_when_the_window_ends() {
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let result = retry_while_capped(
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+            7u32,
+            |channel| {
+                attempts += 1;
+                async move { Ok(Err::<(), _>(channel)) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), 7);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!((2..=11).contains(&attempts), "{attempts} attempts");
+    }
+
+    #[tokio::test]
+    async fn capped_open_stops_at_the_first_error() {
+        let mut attempts = 0;
+        let error =
+            retry_while_capped(Duration::from_secs(5), Duration::from_millis(5), (), |()| {
+                attempts += 1;
+                async { Err::<Result<(), ()>, _>(anyhow::anyhow!("agent gone")) }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "agent gone");
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn the_retry_window_is_ten_seconds() {
+        assert_eq!(TCP_FORWARD_CAP_RETRY_WINDOW, Duration::from_secs(10));
+        assert!(TCP_FORWARD_CAP_RETRY_INTERVAL <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn mailbox_hands_deposits_to_the_owner_once() {
+        let mailbox = Mailbox::new();
+        mailbox.deposit(1u32, "a").unwrap();
+        mailbox.deposit(2, "b").unwrap();
+        let mut owned = HashMap::new();
+        mailbox.drain_into(&mut owned);
+        assert_eq!(owned, HashMap::from([(1, "a"), (2, "b")]));
+        mailbox.drain_into(&mut owned);
+        assert_eq!(owned.len(), 2);
+        assert!(mailbox.close().is_empty());
+    }
+
+    #[test]
+    fn closed_mailbox_returns_late_deposits_and_returns_unadopted_ones() {
+        let mailbox = Mailbox::new();
+        let task_side = mailbox.clone();
+        task_side.deposit(1u32, "unadopted").unwrap();
+        assert_eq!(mailbox.close(), vec!["unadopted"]);
+        assert_eq!(task_side.deposit(2, "late"), Err("late"));
+        let mut owned = HashMap::new();
+        mailbox.drain_into(&mut owned);
+        assert!(owned.is_empty());
     }
 
     #[tokio::test]
