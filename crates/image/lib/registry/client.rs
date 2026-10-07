@@ -21,7 +21,7 @@ use std::{
     time::Instant,
 };
 
-use oci_client::{Client, manifest::ImageIndexEntry};
+use oci_client::{Client, RegistryOperation, manifest::ImageIndexEntry};
 use tokio::{
     io::{AsyncRead, ReadBuf},
     sync::Semaphore,
@@ -49,7 +49,7 @@ use crate::{
     },
 };
 
-use super::{RegistryBuilder, manifest::OciManifest};
+use super::{RegistryBuilder, manifest::OciManifest, retry::with_retries};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -740,11 +740,28 @@ impl Registry {
         })
     }
 
-    /// Fetch manifest and config from the registry.
+    /// Fetch manifest and config from the registry, retrying transient failures.
     async fn fetch_manifest_and_config(
         &self,
         reference: &oci_client::Reference,
     ) -> ImageResult<(Vec<u8>, String, Vec<u8>)> {
+        with_retries("manifest", || {
+            self.fetch_manifest_and_config_once(reference)
+        })
+        .await
+    }
+
+    async fn fetch_manifest_and_config_once(
+        &self,
+        reference: &oci_client::Reference,
+    ) -> ImageResult<(Vec<u8>, String, Vec<u8>)> {
+        // Authenticate first, so a failed token request is an error of its own. oci-client's
+        // request path (`get_auth_token`) drops that error and sends the request without a
+        // token, which a registry that requires one (Docker Hub, even for public images)
+        // answers with 401: the pull then fails as "Not authorized", hiding the real cause.
+        self.client
+            .auth(reference, &self.auth, RegistryOperation::Pull)
+            .await?;
         let (manifest, manifest_digest, config) = self
             .client
             .pull_manifest_and_config(reference, &self.auth)
@@ -2933,6 +2950,165 @@ mod tests {
             .extra_ca_certs(vec![pem])
             .build()
             .unwrap();
+    }
+
+    /// A plain-HTTP registry that, like Docker Hub, answers manifest and blob requests only with
+    /// a bearer token from its token endpoint. The first `token_failures` token requests get a
+    /// 503. Returns the registry's `host:port` and the count of token requests.
+    async fn token_registry(
+        token_failures: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let config = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{}}"#;
+        let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(config)));
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[]}}"#,
+            config.len()
+        );
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = token_requests.clone();
+        let realm = format!("http://{host}/token");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (counter, realm, manifest, config_digest) = (
+                    counter.clone(),
+                    realm.clone(),
+                    manifest.clone(),
+                    config_digest.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte).await {
+                            Ok(1) => head.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
+                    let authorized = head
+                        .lines()
+                        .any(|l| l.eq_ignore_ascii_case("authorization: Bearer t0k"));
+                    let (status, headers, body): (&str, String, Vec<u8>) = if path == "/v2/" {
+                        (
+                            "401 Unauthorized",
+                            format!(
+                                "WWW-Authenticate: Bearer realm=\"{realm}\",service=\"test\"\r\n"
+                            ),
+                            Vec::new(),
+                        )
+                    } else if path.starts_with("/token") {
+                        if counter.fetch_add(1, Ordering::SeqCst) < token_failures {
+                            (
+                                "503 Service Unavailable",
+                                String::new(),
+                                b"try later".to_vec(),
+                            )
+                        } else {
+                            ("200 OK", String::new(), br#"{"token":"t0k"}"#.to_vec())
+                        }
+                    } else if !authorized {
+                        ("401 Unauthorized", String::new(), Vec::new())
+                    } else if path == "/v2/app/manifests/1" {
+                        (
+                            "200 OK",
+                            "Content-Type: application/vnd.oci.image.manifest.v1+json\r\n".into(),
+                            manifest.into_bytes(),
+                        )
+                    } else if path == format!("/v2/app/blobs/{config_digest}") {
+                        ("200 OK", String::new(), config.to_vec())
+                    } else {
+                        ("404 Not Found", String::new(), Vec::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (host, token_requests)
+    }
+
+    fn plain_http_registry(host: &str, cache_dir: &std::path::Path) -> super::Registry {
+        super::Registry::builder(Platform::default(), GlobalCache::new(cache_dir).unwrap())
+            .add_insecure_registries(vec![host.to_owned()])
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_oci_client_hides_a_failed_token_request_behind_a_401() {
+        // Why `fetch_manifest_and_config` authenticates first: oci-client on its own drops the
+        // token error and sends the request without a token. When this test fails, oci-client
+        // reports the token failure itself and the explicit `auth` call can go.
+        let (host, token_requests) = token_registry(usize::MAX).await;
+        let temp = tempdir().unwrap();
+        let registry = plain_http_registry(&host, temp.path());
+        let reference: oci_client::Reference = format!("{host}/app:1").parse().unwrap();
+        let err = registry
+            .client
+            .pull_manifest_and_config(&reference, &registry.auth)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                oci_client::errors::OciDistributionError::UnauthorizedError { .. }
+            ),
+            "{err:?}"
+        );
+        assert!(token_requests.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_fetch_retries_a_failed_token_request() {
+        let (host, token_requests) = token_registry(2).await;
+        let temp = tempdir().unwrap();
+        let registry = plain_http_registry(&host, temp.path());
+        let reference: oci_client::Reference = format!("{host}/app:1").parse().unwrap();
+        let (_manifest, digest, config) = registry
+            .fetch_manifest_and_config(&reference)
+            .await
+            .unwrap();
+        assert!(digest.starts_with("sha256:"), "{digest}");
+        assert!(String::from_utf8(config).unwrap().contains("amd64"));
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_fetch_names_a_token_failure_that_persists() {
+        let (host, token_requests) = token_registry(usize::MAX).await;
+        let temp = tempdir().unwrap();
+        let registry = plain_http_registry(&host, temp.path());
+        let reference: oci_client::Reference = format!("{host}/app:1").parse().unwrap();
+        let err = registry
+            .fetch_manifest_and_config(&reference)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ImageError::Registry(
+                    oci_client::errors::OciDistributionError::AuthenticationFailure(_)
+                )
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("try later"), "{err}");
+        assert_eq!(
+            token_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1 + crate::registry::retry::RETRY_DELAYS.len()
+        );
     }
 
     #[test]
