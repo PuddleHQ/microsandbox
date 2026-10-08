@@ -4602,4 +4602,21 @@ esac
                 .is_ok()
         );
     }
+
+    #[tokio::test]
+    async fn a_new_upper_image_has_its_journal_written() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("upper.ext4");
+
+        LocalBackend::create_upper_ext4(&CreationStorage::for_test(&path), 256, None)
+            .await
+            .unwrap();
+
+        // The 64 MiB journal holds data; the rest of the 256 MiB image stays sparse.
+        let map = microsandbox_utils::extent::ExtentMap::scan(&path)
+            .unwrap()
+            .expect("the test directory's filesystem cannot report allocated ranges");
+        assert!(map.data_bytes() >= 64 * 1024 * 1024);
+        assert!(map.has_holes());
+    }
 }

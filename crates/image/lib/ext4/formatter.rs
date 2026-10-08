@@ -81,6 +81,9 @@ const EXT4_FT_SYMLINK: u8 = 7;
 /// jbd2 superblocks are always 1024 bytes, even on 4 KiB block filesystems.
 const JBD2_SUPERBLOCK_SIZE: usize = 1024;
 
+/// Bytes of zeros written per call while filling the journal.
+const JOURNAL_FILL_CHUNK_BYTES: usize = 1024 * 1024;
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -214,7 +217,7 @@ struct AllocatedExtent {
     block_count: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TreeEncodingMode {
     Upper,
     Rootfs,
@@ -632,7 +635,9 @@ impl BitmapPlan {
 ///
 /// The image is suitable for use as an overlayfs upper layer. It is created as
 /// a sparse file so the initial on-disk footprint is minimal despite the large
-/// logical size.
+/// logical size, except for the journal: its blocks are written (zeros), so a
+/// fresh image occupies the journal's size (64 MiB by default) on the host and
+/// guest journal commits need no host block allocation.
 pub fn format_ext4(path: &Path, options: &Ext4FormatOptions) -> Result<(), Ext4Error> {
     let tree = FileTree::new();
     format_ext4_with_tree(path, options, tree)
@@ -811,6 +816,10 @@ fn format_ext4_with_tree_and_reserved_uuid(
         )?;
     }
     write_journal(&mut file, &layout)?;
+    // A guest writes an upper or volume image; nothing ever writes a rootfs artifact.
+    if encoding_mode == TreeEncodingMode::Upper {
+        fill_journal(&mut file, &layout)?;
+    }
 
     let sb_bytes = build_superblock_with_stats(&layout, &stats)?;
     write_primary_superblock_at(&mut file, &sb_bytes)?;
@@ -2346,6 +2355,32 @@ fn write_journal(
     Ok(())
 }
 
+/// Write zeros over every journal block after the journal superblock, as `mke2fs` does.
+///
+/// A journal left as a hole in the sparse image makes the host allocate blocks, and commit its own
+/// journal, on the first guest write to each journal block: every guest `fsync` until the guest
+/// journal has wrapped once. Written bytes remove that cost. `fallocate` would not: it leaves
+/// unwritten extents, and the first write into one is a host commit as well. The image reads the
+/// same either way; it costs the journal's size (64 MiB by default) on the host.
+fn fill_journal(
+    file: &mut (impl std::io::Write + std::io::Seek),
+    layout: &Layout,
+) -> Result<(), Ext4Error> {
+    let first = (layout.journal_start_block + 1) * EXT4_BLOCK_SIZE as u64;
+    let end = (layout.journal_start_block + layout.journal_blocks as u64) * EXT4_BLOCK_SIZE as u64;
+    let zeros = vec![0u8; JOURNAL_FILL_CHUNK_BYTES];
+
+    file.seek(SeekFrom::Start(first))?;
+    let mut remaining = end - first;
+    while remaining > 0 {
+        let chunk = remaining.min(zeros.len() as u64) as usize;
+        file.write_all(&zeros[..chunk])?;
+        remaining -= chunk as u64;
+    }
+
+    Ok(())
+}
+
 /// Build an ext4 superblock image.
 fn build_superblock(
     layout: &Layout,
@@ -3061,6 +3096,122 @@ mod tests {
 
         assert_eq!(block_bitmap, layout.group_block_bitmap_block(63));
         assert_eq!(inode_bitmap, layout.group_inode_bitmap_block(63));
+    }
+
+    /// Byte range of the journal in an image formatted with `opts`, anchored to the real file by
+    /// checking the jbd2 magic at its start.
+    fn journal_byte_range(path: &Path, opts: &Ext4FormatOptions) -> (u64, u64) {
+        let layout = Layout::compute(opts).unwrap();
+        let start = layout.journal_start_block * EXT4_BLOCK_SIZE as u64;
+        let magic = read_exact_at(path, start, 4);
+        assert_eq!(
+            magic,
+            JBD2_MAGIC.to_be_bytes(),
+            "journal is not where the layout says"
+        );
+        (
+            start,
+            start + layout.journal_blocks as u64 * EXT4_BLOCK_SIZE as u64,
+        )
+    }
+
+    /// Bytes of `start..end` that no allocated range of the file covers, found with
+    /// `SEEK_DATA`/`SEEK_HOLE` (`FSCTL_QUERY_ALLOCATED_RANGES` on Windows). `st_blocks` would
+    /// not do: it counts unwritten (`fallocate`) extents as allocated.
+    fn unallocated_bytes(path: &Path, start: u64, end: u64) -> u64 {
+        let map = microsandbox_utils::extent::ExtentMap::scan(path)
+            .unwrap()
+            .expect("the test directory's filesystem cannot report allocated ranges");
+        let covered: u64 = map
+            .extents
+            .iter()
+            .map(|&(offset, len)| (offset + len).min(end).saturating_sub(offset.max(start)))
+            .sum();
+        (end - start) - covered
+    }
+
+    #[test]
+    fn test_format_writes_the_journal_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.ext4");
+        let opts = Ext4FormatOptions {
+            size_bytes: 256 * 1024 * 1024,
+            journal_blocks: DEFAULT_JOURNAL_BLOCKS,
+        };
+
+        let started = std::time::Instant::now();
+        format_ext4(&path, &opts).unwrap();
+        let elapsed = started.elapsed();
+
+        let (start, end) = journal_byte_range(&path, &opts);
+        assert_eq!(end - start, 64 * 1024 * 1024);
+        assert_eq!(unallocated_bytes(&path, start, end), 0);
+        // Only the journal is written: the rest of the image stays sparse.
+        let map = microsandbox_utils::extent::ExtentMap::scan(&path)
+            .unwrap()
+            .unwrap();
+        assert!(map.has_holes());
+        assert!(map.data_bytes() < (end - start) + 16 * 1024 * 1024);
+        // For the release logs (`cargo test -- --nocapture`).
+        eprintln!(
+            "formatted a 256 MiB image in {elapsed:?}: {} MiB allocated, journal {} MiB",
+            map.data_bytes() / (1024 * 1024),
+            (end - start) / (1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_format_with_tree_writes_the_journal_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upper.ext4");
+        let opts = Ext4FormatOptions {
+            size_bytes: 256 * 1024 * 1024,
+            journal_blocks: 4096,
+        };
+        let mut tree = FileTree::new();
+        tree.root.entries.insert(
+            "upper".into(),
+            TreeNode::Directory(DirectoryNode::new(InodeMetadata::default())),
+        );
+
+        format_ext4_with_tree(&path, &opts, tree).unwrap();
+
+        let (start, end) = journal_byte_range(&path, &opts);
+        assert_eq!(unallocated_bytes(&path, start, end), 0);
+    }
+
+    #[test]
+    fn test_journal_fill_reads_back_as_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zeros.ext4");
+        let opts = Ext4FormatOptions {
+            size_bytes: 256 * 1024 * 1024,
+            journal_blocks: 4096,
+        };
+
+        format_ext4(&path, &opts).unwrap();
+
+        // Everything after the journal superblock block reads as zeros, as a hole would.
+        let (start, end) = journal_byte_range(&path, &opts);
+        let after_superblock = start + EXT4_BLOCK_SIZE as u64;
+        let rest = read_exact_at(&path, after_superblock, (end - after_superblock) as usize);
+        assert!(rest.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn test_rootfs_artifact_leaves_the_journal_sparse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootfs.ext4");
+        let opts = Ext4FormatOptions {
+            size_bytes: 256 * 1024 * 1024,
+            journal_blocks: DEFAULT_JOURNAL_BLOCKS,
+        };
+
+        format_ext4_rootfs_with_tree_and_uuid(&path, &opts, FileTree::new(), [7u8; 16]).unwrap();
+
+        // Also the control for the allocation check above: it does see a journal that is a hole.
+        let (start, end) = journal_byte_range(&path, &opts);
+        assert!(unallocated_bytes(&path, start, end) > (end - start) / 2);
     }
 
     #[cfg(windows)]
