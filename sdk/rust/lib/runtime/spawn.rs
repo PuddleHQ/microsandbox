@@ -42,10 +42,6 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
-};
 
 use microsandbox_image::{Digest, GlobalCache};
 use microsandbox_metrics::{MetricsRegistry, ReserveSlot, SlotReservation};
@@ -640,11 +636,8 @@ impl LocalBackend {
 
         // Build the command.
         let mut cmd = Command::new(&msb_path);
-        #[cfg(windows)]
-        if matches!(mode, SpawnMode::Detached) {
-            let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
-            cmd.creation_flags(flags);
-        }
+        // Before the pre_exec hooks below, which then already run in the new session.
+        super::launcher_isolation::isolate_from_launcher(cmd.as_std_mut(), mode);
         cmd.args(visible);
 
         // Agentd selection is process-wide for the VMM. Forward the explicit
@@ -679,10 +672,6 @@ impl LocalBackend {
             let mut disk_lock_fds: Vec<i32> = disk_locks.iter().map(AsRawFd::as_raw_fd).collect();
             unsafe {
                 cmd.pre_exec(move || {
-                    if startup_write_fd.is_some() {
-                        detach_from_launcher_session()?;
-                    }
-
                     let mut config_mapping =
                         InheritedFdMapping::new(config_raw_fd, microsandbox_runtime::vm::CONFIG_FD);
                     let mut parent_watch_mapping = parent_watch_fd.map(|fd| {
@@ -1569,23 +1558,6 @@ fn dup_inherited_fd(src: i32, dst: i32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     if unsafe { libc::fcntl(dst, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn detach_from_launcher_session() -> std::io::Result<()> {
-    if unsafe { libc::setsid() } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = libc::SIG_IGN;
-    if unsafe { libc::sigemptyset(&mut action.sa_mask) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
