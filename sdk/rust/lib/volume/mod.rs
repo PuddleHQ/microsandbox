@@ -1261,4 +1261,22 @@ mod tests {
     async fn test_remove_local_preserves_starting_restore_named_volume_reference() {
         exercise_active_named_volume_reference(SandboxStatus::Starting).await;
     }
+
+    #[tokio::test]
+    #[cfg(feature = "local")]
+    async fn a_new_disk_volume_has_its_journal_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = VolumeBuilder::new("journal").disk().size(256u32).build();
+
+        provision_volume_path(&config, &CreationStorage::for_test(temp.path()))
+            .await
+            .unwrap();
+
+        // The 64 MiB journal holds data; the rest of the 256 MiB image stays sparse.
+        let map = microsandbox_utils::extent::ExtentMap::scan(&temp.path().join("disk.raw"))
+            .unwrap()
+            .expect("the test directory's filesystem cannot report allocated ranges");
+        assert!(map.data_bytes() >= 64 * 1024 * 1024);
+        assert!(map.has_holes());
+    }
 }
