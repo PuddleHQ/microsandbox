@@ -7,6 +7,7 @@
 pub(crate) mod handle;
 pub(crate) mod launch_contract;
 mod launch_input;
+mod launcher_isolation;
 mod lifecycle;
 #[cfg(feature = "net")]
 mod network_slot;
