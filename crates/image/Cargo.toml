@@ -25,6 +25,7 @@ msb_krun = { workspace = true, features = ["blk"] }
 oci-client.workspace = true
 oci-spec.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 rustls-pki-types.workspace = true
 scopeguard.workspace = true
 scc.workspace = true
@@ -40,6 +41,11 @@ tracing.workspace = true
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 [dev-dependencies]
+bytes.workspace = true
+h2 = "0.4"
+http = "1"
 rcgen.workspace = true
+rustls.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls.workspace = true

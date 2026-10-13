@@ -15,7 +15,7 @@ use crate::{
     cache::{GlobalCache, lock::CacheLockGuard},
     digest::Digest,
     error::{ImageError, ImageResult},
-    registry::retry::with_retries,
+    registry::retry::{RETRY_DELAYS, with_retries},
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -163,56 +163,15 @@ impl Layer {
                             .await?)
                     })
                     .await?;
-                    let file = tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(true)
-                        .write(true)
-                        .open(part_path)
-                        .await
-                        .map_err(|e| ImageError::Cache {
-                            path: part_path.clone(),
-                            source: e,
-                        })?;
-                    (stream, file, 0)
+                    (stream, open_part_file(part_path, false).await?, 0)
                 }
                 DownloadStart::Resume(offset) => {
-                    let blob = with_retries("layer blob", || async {
-                        Ok(client
-                            .pull_blob_stream_partial(
-                                image_ref,
-                                digest_display.as_str(),
-                                offset,
-                                None,
-                            )
-                            .await?)
-                    })
-                    .await?;
-
-                    match blob {
+                    match open_from(client, image_ref, &digest_display, offset).await? {
                         BlobResponse::Partial(stream) => {
-                            let file = tokio::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(part_path)
-                                .await
-                                .map_err(|e| ImageError::Cache {
-                                    path: part_path.clone(),
-                                    source: e,
-                                })?;
-                            (stream, file, offset)
+                            (stream, open_part_file(part_path, true).await?, offset)
                         }
                         BlobResponse::Full(stream) => {
-                            let file = tokio::fs::OpenOptions::new()
-                                .create(true)
-                                .truncate(true)
-                                .write(true)
-                                .open(part_path)
-                                .await
-                                .map_err(|e| ImageError::Cache {
-                                    path: part_path.clone(),
-                                    source: e,
-                                })?;
-                            (stream, file, 0)
+                            (stream, open_part_file(part_path, false).await?, 0)
                         }
                     }
                 }
@@ -233,32 +192,81 @@ impl Layer {
         };
 
         use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| ImageError::Cache {
-                    path: part_path.clone(),
-                    source: e,
-                })?;
-            downloaded += chunk.len() as u64;
+        // A body that breaks off after the stream opened (a registry or CDN cancelling the HTTP/2
+        // stream, a dropped connection) is reopened from `downloaded` with a `Range` request, after
+        // the same pauses as a request that failed before its answer. The hasher and the file hold
+        // exactly the bytes before that offset, so the loop carries on where it stopped.
+        let mut delays = RETRY_DELAYS.iter();
+        loop {
+            let mut broken = None;
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(err) if is_transport_error(&err) => {
+                        broken = Some(err);
+                        break;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                hasher.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| ImageError::Cache {
+                        path: part_path.clone(),
+                        source: e,
+                    })?;
+                downloaded += chunk.len() as u64;
 
-            let should_emit_progress = downloaded.saturating_sub(last_progress_bytes)
-                >= DOWNLOAD_PROGRESS_EMIT_BYTES
-                || expected_size.is_some_and(|total| downloaded >= total);
+                let should_emit_progress = downloaded.saturating_sub(last_progress_bytes)
+                    >= DOWNLOAD_PROGRESS_EMIT_BYTES
+                    || expected_size.is_some_and(|total| downloaded >= total);
 
-            if should_emit_progress {
-                if let Some(p) = progress {
-                    p.send(crate::progress::PullProgress::LayerDownloadProgress {
-                        layer_index,
-                        digest: digest_str.clone(),
-                        downloaded_bytes: downloaded,
-                        total_bytes: expected_size,
-                    });
+                if should_emit_progress {
+                    if let Some(p) = progress {
+                        p.send(crate::progress::PullProgress::LayerDownloadProgress {
+                            layer_index,
+                            digest: digest_str.clone(),
+                            downloaded_bytes: downloaded,
+                            total_bytes: expected_size,
+                        });
+                    }
+                    last_progress_bytes = downloaded;
                 }
-                last_progress_bytes = downloaded;
             }
+            let Some(err) = broken else { break };
+
+            let Some(delay) = delays.next() else {
+                return Err(ImageError::LayerBodyInterrupted {
+                    digest: digest_display,
+                    downloaded,
+                    attempts: 1 + RETRY_DELAYS.len(),
+                    reason: error_chain(&err),
+                });
+            };
+            tracing::warn!(
+                layer_index,
+                digest = %digest_display,
+                downloaded_bytes = downloaded,
+                error = %err,
+                retry_in_ms = delay.as_millis(),
+                "layer download broke off, resuming"
+            );
+            tokio::time::sleep(*delay).await;
+            file.flush().await.map_err(|e| ImageError::Cache {
+                path: part_path.clone(),
+                source: e,
+            })?;
+            stream = match open_from(client, image_ref, &digest_display, downloaded).await? {
+                BlobResponse::Partial(stream) => stream,
+                // The registry ignored the `Range` header and sent the blob from the start.
+                BlobResponse::Full(stream) => {
+                    file = open_part_file(part_path, false).await?;
+                    hasher = Sha256::new();
+                    downloaded = 0;
+                    last_progress_bytes = 0;
+                    stream
+                }
+            };
         }
         file.flush().await.map_err(|e| ImageError::Cache {
             path: part_path.clone(),
@@ -308,6 +316,60 @@ impl Layer {
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+/// Opens the blob from byte `offset` on, retrying a request that failed before its answer.
+async fn open_from(
+    client: &oci_client::Client,
+    image_ref: &oci_client::Reference,
+    digest: &str,
+    offset: u64,
+) -> ImageResult<BlobResponse> {
+    with_retries("layer blob", || async {
+        Ok(client
+            .pull_blob_stream_partial(image_ref, digest, offset, None)
+            .await?)
+    })
+    .await
+}
+
+/// Opens the `.part` file: appending to what is there, or starting it empty.
+async fn open_part_file(part_path: &Path, append: bool) -> ImageResult<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true);
+    if append {
+        options.append(true);
+    } else {
+        options.truncate(true).write(true);
+    }
+    options
+        .open(part_path)
+        .await
+        .map_err(|e| ImageError::Cache {
+            path: part_path.to_path_buf(),
+            source: e,
+        })
+}
+
+/// `err` and its causes, `: `-separated: the client's top-level body error only says "error
+/// decoding response body", the cause says why.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+/// Whether a body error came from the connection (the registry client wraps the transport's
+/// error in an `io::Error`), so that reading again may pass. A digest mismatch the client finds
+/// is not one.
+fn is_transport_error(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|source| source.is::<reqwest::Error>())
+}
 
 /// Compute the SHA-256 hex digest of a file.
 fn compute_sha256_file(path: &Path) -> ImageResult<String> {
@@ -388,6 +450,9 @@ fn determine_download_start(
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod resume_tests;
 
 #[cfg(test)]
 mod tests {
