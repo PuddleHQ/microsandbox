@@ -49,6 +49,21 @@ pub enum ImageError {
         actual: String,
     },
 
+    /// A layer's download kept breaking off after it started, and resuming it did not help.
+    #[error(
+        "layer {digest} download broke off at byte {downloaded}, gave up after {attempts} attempts: {reason}"
+    )]
+    LayerBodyInterrupted {
+        /// The layer digest.
+        digest: String,
+        /// Bytes of the layer on disk when the last attempt broke off.
+        downloaded: u64,
+        /// Requests made for the layer's body.
+        attempts: usize,
+        /// The last error of the body, with its causes.
+        reason: String,
+    },
+
     /// Layer materialization failed.
     #[error("materialization failed for layer {digest}: {message}")]
     Materialize {
