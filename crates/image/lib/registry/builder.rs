@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use oci_client::{
     Client,
     client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol},
@@ -99,21 +101,39 @@ impl RegistryBuilder {
             }
         }
 
-        let platform = self.platform.clone();
-        let client = Client::new(ClientConfig {
+        let settings = Arc::new(ClientSettings {
             protocol,
             extra_root_certificates,
-            platform_resolver: Some(Box::new(move |manifests| {
-                resolve_platform_digest(manifests, &platform)
-            })),
-            ..Default::default()
         });
+        let client = settings.client(Some(self.platform.clone()));
 
         Ok(Registry {
             client,
+            settings,
             auth: self.auth,
             platform: self.platform,
             cache: self.cache,
+        })
+    }
+}
+
+/// What every registry client of one [`Registry`] is built from.
+pub(crate) struct ClientSettings {
+    protocol: ClientProtocol,
+    extra_root_certificates: Vec<Certificate>,
+}
+
+impl ClientSettings {
+    /// A client with its own connection pool. `platform` picks the manifest of a multi-platform
+    /// index; a client that only fetches blobs needs none.
+    pub(crate) fn client(&self, platform: Option<Platform>) -> Client {
+        Client::new(ClientConfig {
+            protocol: self.protocol.clone(),
+            extra_root_certificates: self.extra_root_certificates.clone(),
+            platform_resolver: platform.map(|platform| {
+                Box::new(move |manifests: &[_]| resolve_platform_digest(manifests, &platform)) as _
+            }),
+            ..Default::default()
         })
     }
 }

@@ -49,7 +49,7 @@ use crate::{
     },
 };
 
-use super::{RegistryBuilder, manifest::OciManifest, retry::with_retries};
+use super::{RegistryBuilder, builder::ClientSettings, manifest::OciManifest, retry::with_retries};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -68,6 +68,7 @@ const MAX_LAYER_PIPELINE_CONCURRENCY: usize = 16;
 /// OCI registry client with platform resolution, caching, and progress reporting.
 pub struct Registry {
     pub(super) client: Client,
+    pub(super) settings: Arc<ClientSettings>,
     pub(super) auth: oci_client::secrets::RegistryAuth,
     pub(super) platform: Platform,
     pub(super) cache: GlobalCache,
@@ -495,6 +496,7 @@ impl Registry {
         let reference = reference.clone();
         let options = options.clone();
         let client = self.client.clone();
+        let settings = Arc::clone(&self.settings);
         let auth = self.auth.clone();
         let platform = self.platform.clone();
 
@@ -503,6 +505,7 @@ impl Registry {
         tokio::spawn(async move {
             let registry = Self {
                 client,
+                settings,
                 auth,
                 platform,
                 cache,
@@ -522,6 +525,7 @@ impl Registry {
     ) -> ImageResult<PullResult> {
         let scoped = Self {
             client: self.client.clone(),
+            settings: Arc::clone(&self.settings),
             auth: self.auth.clone(),
             platform: self.platform.clone(),
             cache: self.cache.operation_or_new(),
@@ -999,7 +1003,8 @@ impl Registry {
             .enumerate()
             .map(|(i, layer_desc)| {
                 let layer = Layer::new(layer_desc.digest.clone(), &self.cache);
-                let client = self.client.clone();
+                let settings = Arc::clone(&self.settings);
+                let auth = self.auth.clone();
                 let oci_ref = oci_ref.clone();
                 let size = layer_desc.size;
                 let progress = progress.clone();
@@ -1061,12 +1066,16 @@ impl Registry {
                             )),
                         });
                     }
-                    if staged_tar_path.is_none()
-                        && let Err(error) = layer
-                            .download(&client, &oci_ref, size, force, progress.as_ref(), i)
-                            .await
-                    {
-                        return Err(LayerPipelineFailure { error });
+                    if staged_tar_path.is_none() {
+                        let downloaded = async {
+                            let client = blob_client(&settings, &auth, &oci_ref).await?;
+                            layer
+                                .download(&client, &oci_ref, size, force, progress.as_ref(), i)
+                                .await
+                        };
+                        if let Err(error) = downloaded.await {
+                            return Err(LayerPipelineFailure { error });
+                        }
                     }
 
                     // Acquire per-layer flock to coordinate with concurrent pulls.
@@ -1898,6 +1907,29 @@ async fn all_layers_materialized_async(cache: &GlobalCache, diff_ids: &[Digest])
 
 async fn path_exists_async(path: &Path) -> bool {
     tokio::fs::metadata(path).await.is_ok()
+}
+
+/// A client of its own for one layer's blob, authenticated for pulling `reference`.
+///
+/// Layers never share an HTTP/2 connection. A CDN in front of a registry (mcr.microsoft.com's
+/// data endpoint does) may hold back the answer to a stream opened on a connection that is busy
+/// with other layers' bodies and cancel it after about 10 s (`RST_STREAM` with `CANCEL`, before
+/// any headers). On a shared connection every retry of that request queues behind the same
+/// bodies and is cancelled again, so the pull fails although the registry is fine.
+async fn blob_client(
+    settings: &ClientSettings,
+    auth: &oci_client::secrets::RegistryAuth,
+    reference: &oci_client::Reference,
+) -> ImageResult<Client> {
+    let client = settings.client(None);
+    with_retries("token", || async {
+        client
+            .auth(reference, auth, RegistryOperation::Pull)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    Ok(client)
 }
 
 fn layer_pipeline_concurrency(layer_count: usize) -> usize {
