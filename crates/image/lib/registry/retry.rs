@@ -47,7 +47,7 @@ where
                 };
                 tracing::warn!(
                     request = what,
-                    error = %err,
+                    error = %error_chain(&err),
                     retry_in_ms = delay.as_millis(),
                     "registry request failed, retrying"
                 );
@@ -56,6 +56,20 @@ where
             other => return other,
         }
     }
+}
+
+/// `err` and its causes, `: `-separated. The registry client's top-level message ("error sending
+/// request for url (...)") does not say what went wrong; its causes do (for example "stream error
+/// received: stream no longer needed").
+pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// Whether a registry failure may pass if the same request is sent again: a request that never
