@@ -15,7 +15,7 @@ use crate::{
     cache::{GlobalCache, lock::CacheLockGuard},
     digest::Digest,
     error::{ImageError, ImageResult},
-    registry::retry::{RETRY_DELAYS, with_retries},
+    registry::retry::{RETRY_DELAYS, error_chain, with_retries},
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -348,19 +348,6 @@ async fn open_part_file(part_path: &Path, append: bool) -> ImageResult<tokio::fs
             path: part_path.to_path_buf(),
             source: e,
         })
-}
-
-/// `err` and its causes, `: `-separated: the client's top-level body error only says "error
-/// decoding response body", the cause says why.
-fn error_chain(err: &dyn std::error::Error) -> String {
-    let mut out = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        out.push_str(": ");
-        out.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    out
 }
 
 /// Whether a body error came from the connection (the registry client wraps the transport's
