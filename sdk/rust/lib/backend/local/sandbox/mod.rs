@@ -890,6 +890,12 @@ impl LocalBackend {
         if alive {
             return Ok(sandbox);
         }
+        // Not stale until the whole process is gone: a killed runtime can release its lifecycle
+        // lock before its disk locks, and a start in between fails on the still-locked disks.
+        #[cfg(target_os = "linux")]
+        if process_exit::thread_group_exiting(run.pid)? {
+            return Ok(sandbox);
+        }
 
         if let Some((run_dir, sandboxes_dir)) = socket_roots {
             crate::runtime::remove_socket_artifacts_at(run_dir, sandboxes_dir, &sandbox.name)?;
@@ -2204,6 +2210,100 @@ mod tests {
             Some(run_entity::TerminationReason::InternalError)
         );
         assert!(run.terminated_at.is_some());
+    }
+
+    /// A runtime whose leader has exited while its other threads still hold its descriptors
+    /// (its disk locks among them) stays live in the catalog until the whole process is gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reconcile_keeps_a_runtime_whose_threads_are_still_exiting() {
+        use std::io::{BufRead, Write};
+        use std::process::Stdio;
+
+        let temp = tempfile::Builder::new()
+            .prefix("msb-exiting")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
+        let sandbox_id =
+            LocalBackend::insert_sandbox_record(pools.write(), &test_config("exiting"))
+                .await
+                .unwrap();
+        LocalBackend::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Running)
+            .await
+            .unwrap();
+        let mut child = scopeguard::guard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::local::sandbox::process_exit::tests::exit_barrier_child",
+                    "--nocapture",
+                ])
+                .env("MSB_EXIT_BARRIER_CHILD", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            |mut child| {
+                let _ = child.kill();
+                let _ = child.wait();
+            },
+        );
+        let pid = child.id() as i32;
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut wait_line = |expected: &str| {
+            loop {
+                let mut line = String::new();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0);
+                if line.trim() == expected {
+                    break;
+                }
+            }
+        };
+        wait_line("ready");
+        run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(sandbox_id),
+            pid: Set(Some(pid)),
+            status: Set(run_entity::RunStatus::Running),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+        let run_dir = temp.path().join("run");
+        let sandboxes_dir = temp.path().join("sandboxes");
+        let reconcile = || async {
+            let sandbox = sandbox_entity::Entity::find_by_id(sandbox_id)
+                .one(pools.read())
+                .await
+                .unwrap()
+                .unwrap();
+            LocalBackend::reconcile_sandbox_runtime_state_with_paths(
+                &pools,
+                sandbox,
+                Some((&run_dir, &sandboxes_dir)),
+            )
+            .await
+            .unwrap()
+            .status
+        };
+
+        // The leader exits; a worker thread keeps the process's descriptors.
+        child.stdin.as_mut().unwrap().write_all(b"l").unwrap();
+        wait_line("lifecycle-released");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while LocalBackend::pid_is_alive(pid) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(reconcile().await, SandboxStatus::Running);
+
+        // Once the whole process is gone, the run is stale.
+        child.stdin.as_mut().unwrap().write_all(b"d").unwrap();
+        wait_line("disk-released");
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(reconcile().await, SandboxStatus::Crashed);
     }
 
     #[tokio::test]

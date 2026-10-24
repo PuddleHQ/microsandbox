@@ -75,6 +75,34 @@ impl RuntimeExit {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Whether a recorded runtime that no longer counts as alive still has threads exiting.
+///
+/// A killed runtime's leader turns zombie at once, while its other threads keep the shared
+/// descriptor table, and with it the inherited disk locks, until the last of them is gone. The
+/// lifecycle lock is one of those descriptors, so it can be free while the disks are still
+/// locked. Only a process pidfd reports the whole thread group gone; a reaped PID reports it
+/// gone too.
+pub(super) fn thread_group_exiting(pid: Option<i32>) -> std::io::Result<bool> {
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return Ok(false);
+    };
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let process = RuntimeExit(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+    Ok(!process.has_exited()?)
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
