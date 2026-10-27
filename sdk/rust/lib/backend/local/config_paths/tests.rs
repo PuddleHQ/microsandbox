@@ -313,6 +313,27 @@ fn absolute_spelling_and_guest_defaults_are_preserved() {
     assert_eq!(config.paths.msb, None::<PathBuf>);
 }
 
+#[test]
+fn builder_runtime_paths_and_home_need_no_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let backend = LocalBackend::builder()
+        .home(base.join("home"))
+        .config_path(base.join("missing-config.json"))
+        .msb_path(base.join("rt/msb"))
+        .libkrunfw_path(base.join("rt/libkrunfw"))
+        .agentd_path(base.join("rt/agentd"))
+        .ignore_environment()
+        .build_lazy()
+        .unwrap();
+    let paths = &backend.config().paths;
+    assert_eq!(backend.config().home(), base.join("home"));
+    assert_eq!(paths.msb, Some(base.join("rt/msb")));
+    assert_eq!(paths.libkrunfw, Some(base.join("rt/libkrunfw")));
+    assert_eq!(paths.agentd, Some(base.join("rt/agentd")));
+    assert!(backend.ignores_environment());
+}
+
 // Programmatic settings use the same preparation as production constructors.
 fn local_with_config(
     config: GlobalConfig,
