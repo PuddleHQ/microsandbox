@@ -109,12 +109,27 @@ impl BackendConfig {
     /// Cloud profile lookup does not prepare local runtime paths or validate local defaults.
     /// Runtime lookup and diagnostics also use this; callers enforce backend permission separately.
     pub(crate) fn prepare_for_local_backend(
+        self,
+        builder: GlobalConfigPatch,
+    ) -> MicrosandboxResult<Self> {
+        self.prepare_for_local_backend_with(builder, PathsConfigPatch::new(), false)
+    }
+
+    /// As [`Self::prepare_for_local_backend`], for an embedder that owns its runtime.
+    /// `explicit` runtime paths sit above the `MSB_*` environment and the SDK registration (below
+    /// managed policy), and `ignore_environment` skips those variables altogether.
+    pub(crate) fn prepare_for_local_backend_with(
         mut self,
         mut builder: GlobalConfigPatch,
+        explicit: PathsConfigPatch,
+        ignore_environment: bool,
     ) -> MicrosandboxResult<Self> {
         let mut builtins = GlobalConfigPatch::from_present_fields(GlobalConfig::default());
-        let mut runtime =
-            GlobalConfigPatch::new().paths(PathsConfigPatch::from_env_or_sdk(&self.managed.paths)?);
+        let mut runtime = GlobalConfigPatch::new().paths(PathsConfigPatch::from_env_or_sdk(
+            &self.managed.paths,
+            &explicit,
+            ignore_environment,
+        )?);
         // Capture the old effective spelling before anchoring individual source layers.
         // Existing runtimes keep writing there; new writers use only the captured home.
         #[cfg(feature = "local")]
@@ -746,6 +761,53 @@ mod tests {
                 None => std::env::remove_var("MSB_PATH"),
             }
         }
+    }
+
+    #[test]
+    fn explicit_runtime_paths_take_their_variables_place() {
+        let env = |name: &str| Some(format!("env-{name}"));
+        let s = |value: &str| Some(Some(std::path::PathBuf::from(value)));
+        let paths = |explicit: PathsConfigPatch| {
+            let patch =
+                PathsConfigPatch::from_reader_or_sdk(&PathsConfigPatch::new(), &explicit, env)
+                    .unwrap();
+            (patch.msb, patch.libkrunfw, patch.agentd)
+        };
+
+        // Without explicit paths the environment is read, as before.
+        assert_eq!(
+            paths(PathsConfigPatch::new()),
+            (
+                s("env-MSB_PATH"),
+                s("env-MSB_LIBKRUNFW_PATH"),
+                s("env-MSB_AGENTD_PATH")
+            )
+        );
+        // Each explicit path replaces its own variable and no other.
+        let mut explicit = PathsConfigPatch::new();
+        explicit.msb_mut("x-msb".into());
+        explicit.agentd_mut("x-agentd".into());
+        assert_eq!(
+            paths(explicit),
+            (s("x-msb"), s("env-MSB_LIBKRUNFW_PATH"), s("x-agentd"))
+        );
+    }
+
+    #[test]
+    fn explicit_paths_resolve_above_user_config_and_without_the_environment() {
+        let mut explicit = PathsConfigPatch::new();
+        explicit.msb_mut("x-msb".into());
+        explicit.libkrunfw_mut("x-fw".into());
+        let user = r#"{"paths":{"msb":"user-msb","agentd":"user-agentd"}}"#;
+        let config = BackendConfig::new(serde_json::from_str(user).unwrap(), Default::default())
+            .prepare_for_local_backend_with(Default::default(), explicit, true)
+            .unwrap();
+        let paths = &config.resolved_config().paths;
+        let abs = |value: &str| Some(std::path::absolute(value).unwrap());
+        assert_eq!(paths.msb, abs("x-msb"));
+        assert_eq!(paths.libkrunfw, abs("x-fw"));
+        // Ignoring the environment leaves the user's config file in charge of the rest.
+        assert_eq!(paths.agentd, abs("user-agentd"));
     }
 
     #[test]

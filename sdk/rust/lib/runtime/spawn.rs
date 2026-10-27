@@ -644,10 +644,13 @@ impl LocalBackend {
         // path from the resolved backend config into the child environment.
         // Managed clears also remove inherited overrides. The child validates and eagerly
         // reads the selected payload before constructing any filesystem.
-        cmd.env_remove("MSB_AGENTD_PATH");
-        if let Some(path) = &global.paths.agentd {
-            cmd.env("MSB_AGENTD_PATH", path);
-        }
+        configure_runtime_env(
+            cmd.as_std_mut(),
+            &global.home(),
+            global.paths.agentd.as_deref(),
+            self.ignores_environment()
+                .then(|| std::env::vars_os().map(|(name, _)| name)),
+        );
 
         // Prevent the sandbox process from inheriting the parent's terminal on
         // stdin — the VMM's implicit console auto-detects terminals and sets raw
@@ -1009,6 +1012,36 @@ fn startup_error_with_cleanup(
             startup
         }
         Err(cleanup) => MicrosandboxError::Runtime(format!("{startup}; {cleanup}")),
+    }
+}
+
+/// Whether `name` is an msb variable (`MSB_` prefix, ASCII case-insensitive for Windows).
+fn is_msb_variable(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"MSB_"))
+}
+
+/// Set the runtime process's `MSB_*` variables from the resolved backend config, so it never
+/// depends on this process's environment: `MSB_HOME` is the backend's home (the runtime derives
+/// its TLS CA directory from it), `MSB_AGENTD_PATH` is the resolved agent or unset. With
+/// `inherited` (the names in this process's environment, when the backend ignores it), every
+/// `MSB_*` variable among them is removed first.
+fn configure_runtime_env(
+    cmd: &mut std::process::Command,
+    home: &Path,
+    agentd: Option<&Path>,
+    inherited: Option<impl IntoIterator<Item = OsString>>,
+) {
+    for name in inherited.into_iter().flatten() {
+        if is_msb_variable(&name) {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("MSB_HOME", home);
+    cmd.env_remove("MSB_AGENTD_PATH");
+    if let Some(path) = agentd {
+        cmd.env("MSB_AGENTD_PATH", path);
     }
 }
 
@@ -2742,6 +2775,51 @@ mod tests {
     use microsandbox_types::HandoffInit;
     use sea_orm::{ActiveModelTrait, Set};
     use tempfile::tempdir;
+
+    use super::configure_runtime_env;
+
+    fn envs(cmd: &std::process::Command) -> HashMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn runtime_process_gets_its_home_and_agent_from_the_config_not_the_environment() {
+        let mut cmd = std::process::Command::new("msb");
+        configure_runtime_env(
+            &mut cmd,
+            Path::new("/h"),
+            Some(Path::new("/a")),
+            None::<Vec<OsString>>,
+        );
+        let set = envs(&cmd);
+        assert_eq!(set["MSB_HOME"].as_deref(), Some("/h"));
+        assert_eq!(set["MSB_AGENTD_PATH"].as_deref(), Some("/a"));
+        assert_eq!(set.len(), 2);
+
+        let mut cmd = std::process::Command::new("msb");
+        configure_runtime_env(&mut cmd, Path::new("/h"), None, None::<Vec<OsString>>);
+        assert_eq!(envs(&cmd)["MSB_AGENTD_PATH"], None);
+    }
+
+    #[test]
+    fn an_isolated_runtime_process_inherits_no_other_msb_variable() {
+        let names =
+            ["MSB_BLOCK_GROW_AHEAD", "msb_backend", "PATH", "NOT_MSB_X"].map(OsString::from);
+        let mut cmd = std::process::Command::new("msb");
+        configure_runtime_env(&mut cmd, Path::new("/h"), None, Some(names));
+        let set = envs(&cmd);
+        assert_eq!(set["MSB_BLOCK_GROW_AHEAD"], None);
+        assert_eq!(set["msb_backend"], None);
+        assert!(!set.contains_key("PATH") && !set.contains_key("NOT_MSB_X"));
+        assert_eq!(set["MSB_HOME"].as_deref(), Some("/h"));
+    }
 
     use microsandbox_runtime::launch::{
         CheckpointRestoreConfig, LaunchConfig, RootfsUpperLayerConfig,
