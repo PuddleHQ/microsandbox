@@ -612,12 +612,41 @@ impl GlobalConfig {
 
 impl PathsConfigPatch {
     /// Capture runtime paths from the environment, falling back to SDK-provided paths.
-    pub(crate) fn from_env_or_sdk(managed: &Self) -> MicrosandboxResult<Self> {
+    ///
+    /// A path in `explicit` (set on the backend builder) is kept as it is and its variable and SDK
+    /// registration are not consulted. With `ignore_environment` the `MSB_PATH`,
+    /// `MSB_LIBKRUNFW_PATH` and `MSB_AGENTD_PATH` variables are not read at all.
+    pub(crate) fn from_env_or_sdk(
+        managed: &Self,
+        explicit: &Self,
+        ignore_environment: bool,
+    ) -> MicrosandboxResult<Self> {
+        Self::from_reader_or_sdk(managed, explicit, |name| {
+            if ignore_environment {
+                None
+            } else {
+                std::env::var(name).ok()
+            }
+        })
+    }
+
+    /// [`Self::from_env_or_sdk`] with the variable lookup passed in.
+    pub(crate) fn from_reader_or_sdk(
+        managed: &Self,
+        explicit: &Self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> MicrosandboxResult<Self> {
         // A failed infallible SDK registration must not silently fall back to another
         // runtime. Higher-priority environment or managed values can replace it.
         let runtime_path =
-            |name: &str, managed: bool, sdk: fn() -> MicrosandboxResult<Option<PathBuf>>| {
-                match std::env::var(name).ok() {
+            |name: &str,
+             is_explicit: bool,
+             managed: bool,
+             sdk: fn() -> MicrosandboxResult<Option<PathBuf>>| {
+                if is_explicit {
+                    return Ok(None);
+                }
+                match env(name) {
                     Some(path) => Ok(Some(PathBuf::from(path))),
                     None if managed => Ok(None),
                     None => sdk(),
@@ -625,18 +654,26 @@ impl PathsConfigPatch {
             };
         let libkrunfw = runtime_path(
             "MSB_LIBKRUNFW_PATH",
+            explicit.libkrunfw.is_some(),
             managed.libkrunfw.is_some(),
             sdk_libkrunfw_path,
         )?;
-        let msb = runtime_path("MSB_PATH", managed.msb.is_some(), sdk_msb_path)?;
-        let mut patch = Self::new();
+        let msb = runtime_path(
+            "MSB_PATH",
+            explicit.msb.is_some(),
+            managed.msb.is_some(),
+            sdk_msb_path,
+        )?;
+        let mut patch = explicit.clone();
         if let Some(msb) = msb {
             patch.msb_mut(msb);
         }
         if let Some(libkrunfw) = libkrunfw {
             patch.libkrunfw_mut(libkrunfw);
         }
-        if let Some(agentd) = std::env::var_os("MSB_AGENTD_PATH") {
+        if explicit.agentd.is_none()
+            && let Some(agentd) = env("MSB_AGENTD_PATH")
+        {
             patch.agentd_mut(PathBuf::from(agentd));
         }
         Ok(patch)

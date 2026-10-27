@@ -58,8 +58,8 @@ use super::{
 };
 use crate::backend::SnapshotBackend;
 use crate::config::{
-    DatabaseConfig, GlobalConfig, GlobalConfigPatch, RegistryConfig, RegistryEntry,
-    RegistryOptions, RegistrySettingsPatch, layers::BackendConfig,
+    DatabaseConfig, GlobalConfig, GlobalConfigPatch, PathsConfigPatch, RegistryConfig,
+    RegistryEntry, RegistryOptions, RegistrySettingsPatch, layers::BackendConfig,
 };
 use crate::{MicrosandboxError, MicrosandboxResult};
 
@@ -81,6 +81,7 @@ pub struct LocalBackend {
     control_sessions: control::ControlSessions,
     metrics_lookup: metrics_lookup::MetricsLookup,
     pub(crate) metrics_registry_names: Vec<String>,
+    ignore_environment: bool,
 }
 
 /// Fluent builder for [`LocalBackend`]. Construct via [`LocalBackend::builder`].
@@ -98,6 +99,8 @@ pub struct LocalBackendBuilder {
     config: GlobalConfigPatch,
     config_path: Option<PathBuf>,
     managed_config_path: Option<PathBuf>,
+    runtime_paths: PathsConfigPatch,
+    ignore_environment: bool,
 }
 
 struct MigrationLock {
@@ -145,6 +148,7 @@ impl LocalBackend {
             control_sessions: control::ControlSessions::default(),
             metrics_lookup: metrics_lookup::MetricsLookup::default(),
             metrics_registry_names,
+            ignore_environment: false,
         }
     }
 
@@ -210,6 +214,12 @@ impl LocalBackend {
             .into_config()
             .resolve(hostname, self.config())
             .await
+    }
+
+    /// Whether the builder asked to ignore the `MSB_*` environment (see
+    /// [`LocalBackendBuilder::ignore_environment`]).
+    pub(crate) fn ignores_environment(&self) -> bool {
+        self.ignore_environment
     }
 
     /// Clone the backend-owned config handle for APIs that need to return the
@@ -326,6 +336,35 @@ impl LocalBackendBuilder {
     /// Override the home directory (default: `~/.microsandbox`).
     pub fn home(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.home_mut(path.into());
+        self
+    }
+
+    /// Use this `msb` executable. It beats `MSB_PATH`, a registered SDK path and the config
+    /// file's `paths.msb`; only managed policy overrides it.
+    pub fn msb_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.runtime_paths.msb_mut(path.into());
+        self
+    }
+
+    /// Use this `libkrunfw` library. Same precedence as [`msb_path`](Self::msb_path).
+    pub fn libkrunfw_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.runtime_paths.libkrunfw_mut(path.into());
+        self
+    }
+
+    /// Use this guest agent binary. Same precedence as [`msb_path`](Self::msb_path).
+    pub fn agentd_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.runtime_paths.agentd_mut(path.into());
+        self
+    }
+
+    /// Keep the process environment out of this backend: `MSB_PATH`, `MSB_LIBKRUNFW_PATH`
+    /// and `MSB_AGENTD_PATH` are not read, and the runtime process the backend starts does not
+    /// inherit any `MSB_*` variable. It still gets `MSB_HOME` (this backend's home) and, when set,
+    /// `MSB_AGENTD_PATH`. Lets an embedding application own its runtime without changing its own
+    /// environment.
+    pub fn ignore_environment(mut self) -> Self {
+        self.ignore_environment = true;
         self
     }
 
@@ -488,14 +527,17 @@ impl LocalBackendBuilder {
     pub fn build_lazy(self) -> MicrosandboxResult<LocalBackend> {
         let path = self.config_path.unwrap_or_else(crate::config::config_path);
         let config = BackendConfig::load_from(&path, self.managed_config_path.as_deref())?
-            .prepare_for_local_backend(self.config)?;
+            .prepare_for_local_backend_with(
+                self.config,
+                self.runtime_paths,
+                self.ignore_environment,
+            )?;
         config.require_backend(BackendKind::Local, None)?;
 
-        Ok(LocalBackend::from_backend_config(
-            config,
-            BackendSelectionSource::Programmatic,
-            None,
-        ))
+        let mut backend =
+            LocalBackend::from_backend_config(config, BackendSelectionSource::Programmatic, None);
+        backend.ignore_environment = self.ignore_environment;
+        Ok(backend)
     }
 }
 
