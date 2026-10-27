@@ -1724,7 +1724,7 @@ fn agent_bulk_console_pipe_name(sandbox_id: i32) -> String {
 // Functions: VM Builder
 //--------------------------------------------------------------------------------------------------
 
-fn apply_block_writeback_limit(
+fn apply_block_host_policy(
     mut disk: msb_krun::DiskBuilder,
     format: msb_krun::DiskImageFormat,
     read_only: bool,
@@ -1736,7 +1736,31 @@ fn apply_block_writeback_limit(
     {
         disk = disk.writeback_limit(limit.clone());
     }
+    if let Some(enabled) = block_grow_ahead_override() {
+        disk = disk.grow_ahead(enabled);
+    }
     disk
+}
+
+/// `MSB_BLOCK_GROW_AHEAD` turns libkrun's grow-ahead on or off for every writable raw disk
+/// (on by default on Linux hosts, where it fills a 64 MiB chunk's holes on the first write).
+fn block_grow_ahead_override() -> Option<bool> {
+    parse_block_grow_ahead(std::env::var("MSB_BLOCK_GROW_AHEAD").ok().as_deref())
+}
+
+fn parse_block_grow_ahead(value: Option<&str>) -> Option<bool> {
+    let raw = value?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" | "yes" => Some(true),
+        "0" | "off" | "false" | "no" => Some(false),
+        _ => {
+            tracing::warn!(
+                value = raw,
+                "ignoring invalid MSB_BLOCK_GROW_AHEAD (use on or off)"
+            );
+            None
+        }
+    }
 }
 
 fn attach_upper_layers(
@@ -2109,7 +2133,7 @@ fn build_vm(
                     .format(format)
                     .read_only(read_only)
                     .direct_io(direct_io);
-                apply_block_writeback_limit(d, format, read_only, writeback_limit.as_ref())
+                apply_block_host_policy(d, format, read_only, writeback_limit.as_ref())
             });
         } else if let Some(ref upper) = vm.rootfs_upper {
             let upper = upper.clone();
@@ -2117,7 +2141,7 @@ fn build_vm(
             let writeback_limit = writeback_limit.cloned();
             builder = builder.disk(move |d| {
                 let d = d.path(&upper).format(format).read_only(false);
-                apply_block_writeback_limit(d, format, false, writeback_limit.as_ref())
+                apply_block_host_policy(d, format, false, writeback_limit.as_ref())
             });
         }
     } else if vm.rootfs_disk_spec.is_some() || vm.rootfs_disk.is_some() {
@@ -2150,7 +2174,7 @@ fn build_vm(
                     .format(format)
                     .read_only(read_only)
                     .direct_io(direct_io);
-                apply_block_writeback_limit(d, format, read_only, writeback_limit.as_ref())
+                apply_block_host_policy(d, format, read_only, writeback_limit.as_ref())
             });
         } else if let Some(ref disk_path) = vm.rootfs_disk {
             let format = validate_disk_format(vm.rootfs_disk_format.as_deref())
@@ -2160,7 +2184,7 @@ fn build_vm(
             let writeback_limit = writeback_limit.cloned();
             builder = builder.disk(move |d| {
                 let d = d.path(&disk_path).format(format).read_only(readonly);
-                apply_block_writeback_limit(d, format, readonly, writeback_limit.as_ref())
+                apply_block_host_policy(d, format, readonly, writeback_limit.as_ref())
             });
         }
         if bootstrap.block_root.is_none() {
@@ -2594,7 +2618,7 @@ fn build_vm(
                     .cache(msb_krun::CacheMode::Unsafe)
                     .sync(msb_krun::SyncMode::None);
             }
-            apply_block_writeback_limit(d, format, readonly, writeback_limit.as_ref())
+            apply_block_host_policy(d, format, readonly, writeback_limit.as_ref())
         });
     }
 
@@ -4067,7 +4091,8 @@ mod tests {
         AGENT_BULK_QUEUE_SIZE, AGENT_CONTROL_QUEUE_SIZE, AgentTransportProfile, ConsoleSharedState,
         HostPermissions, StatVirtualization, agent_kernel_cmdline, agent_primary_queue_size,
         append_block_root_env, bind_rootfs_backend, encode_bootstrap_frame, ensure_bind_root_dev,
-        guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override, parse_mount_spec,
+        guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override,
+        parse_block_grow_ahead, parse_mount_spec,
         prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
         thp_kernel_cmdline, validate_disk_format,
     };
@@ -5074,6 +5099,19 @@ mod tests {
             guest_shutdown_flush_timeout_with_override(true, Some("125")),
             Duration::from_millis(125)
         );
+    }
+
+    #[test]
+    fn test_block_grow_ahead_override_reads_on_and_off() {
+        assert_eq!(parse_block_grow_ahead(None), None);
+        for on in ["1", "on", "TRUE", " yes "] {
+            assert_eq!(parse_block_grow_ahead(Some(on)), Some(true), "{on}");
+        }
+        for off in ["0", "off", "False", "no"] {
+            assert_eq!(parse_block_grow_ahead(Some(off)), Some(false), "{off}");
+        }
+        assert_eq!(parse_block_grow_ahead(Some("maybe")), None);
+        assert_eq!(parse_block_grow_ahead(Some("")), None);
     }
 
     #[test]
