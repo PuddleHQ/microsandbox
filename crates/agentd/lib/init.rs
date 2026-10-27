@@ -115,6 +115,8 @@ mod linux {
     };
     use crate::error::{AgentdError, AgentdResult};
 
+    /// Where the overlay upper's ext4 filesystem is mounted, before and (for trimming) after the pivot.
+    const UPPER_FS_DIR: &str = "/.msb/rootfs/upperfs";
     const UPPER_METRICS_PATH: &str = "/sys/kernel/msb_metrics/upper_path";
     const UPPER_METRICS_REGISTER_ATTEMPTS: usize = 100;
     const UPPER_METRICS_REGISTER_RETRY: Duration = Duration::from_millis(10);
@@ -274,17 +276,19 @@ mod linux {
     pub fn mount_block_root(spec: &BlockRootSpec) -> AgentdResult<()> {
         mkdir_ignore_exists("/newroot")?;
 
-        match spec {
+        let upper_on_block_device = match spec {
             BlockRootSpec::DiskImage { device, fstype } => {
                 mount_disk_image(device, fstype.as_deref())?;
                 crate::root_disk::register("/newroot", device);
+                false
             }
             BlockRootSpec::OciErofs { lower, upper } => {
                 mount_oci_erofs(lower, upper)?;
+                matches!(upper, BlockRootUpper::Device { .. })
             }
-        }
+        };
 
-        pivot_to_newroot()?;
+        pivot_to_newroot(upper_on_block_device)?;
 
         Ok(())
     }
@@ -328,8 +332,8 @@ mod linux {
 
         // Mount the writable upper: a block-device filesystem (managed ext4
         // or user disk image), or a RAM-backed tmpfs for tmpfs root disks.
-        let upperfs_dir = "/.msb/rootfs/upperfs";
-        mkdir_ignore_exists("/.msb/rootfs/upperfs")?;
+        let upperfs_dir = UPPER_FS_DIR;
+        mkdir_ignore_exists(UPPER_FS_DIR)?;
         match upper {
             BlockRootUpper::Device { device, fstype } => {
                 mount::mount(
@@ -405,7 +409,11 @@ mod linux {
     }
 
     /// Bind-mount /.msb into /newroot, then MS_MOVE + chroot + re-mount essentials.
-    fn pivot_to_newroot() -> AgentdResult<()> {
+    ///
+    /// With `expose_upper`, the block-backed overlay upper stays reachable at [`UPPER_FS_DIR`] in the final root. An overlay root cannot be
+    /// trimmed: overlayfs does not forward `FITRIM`, so `fstrim /` fails with "the discard operation is not supported". The upper's own
+    /// ext4 mount takes it (`fstrim /.msb/rootfs/upperfs`), and `/proc/mounts` already names this path as the overlay's `upperdir`.
+    fn pivot_to_newroot(expose_upper: bool) -> AgentdResult<()> {
         let msb_target = "/newroot/.msb";
         mkdir_ignore_exists(msb_target)?;
         mount::mount(
@@ -416,6 +424,21 @@ mod linux {
             None::<&str>,
         )
         .map_err(|e| AgentdError::Init(format!("failed to bind-mount /.msb into /newroot: {e}")))?;
+
+        if expose_upper {
+            // The /.msb bind above is not recursive, so the upper's mount is not part of it. A guest that cannot trim its root disk still boots,
+            // so a failure here is reported and ignored.
+            let target = format!("/newroot{UPPER_FS_DIR}");
+            if let Err(e) = mount::mount(
+                Some(UPPER_FS_DIR),
+                target.as_str(),
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                eprintln!("agentd: could not expose the root disk at {UPPER_FS_DIR}: {e}");
+            }
+        }
 
         unistd::chdir("/newroot")
             .map_err(|e| AgentdError::Init(format!("failed to chdir /newroot: {e}")))?;

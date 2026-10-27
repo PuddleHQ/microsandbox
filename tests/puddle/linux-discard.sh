@@ -14,6 +14,9 @@
 #   fstrim:     `fstrim -v /data` exits 0
 #   shrunk:     the image's allocated size after the trim (and after the stop) is under 300 MiB
 #               (1 GiB written, ext4 metadata and journal stay; stock: refused, the image keeps ~1 GiB)
+#   rootdisk:   the same for the sandbox's root disk: 512 MiB written to / and deleted, `fstrim` of the
+#               root disk's ext4 (/.msb/rootfs/upperfs; the overlay at / cannot be trimmed) exits 0 and
+#               the root image (sandboxes/<name>/upper.ext4) drops back near its size after create
 # Prints "CASE <name>: PASS|FAIL ..." per case. Exit 0: all passed. 1: a case failed. 2: setup failed.
 set -uo pipefail
 
@@ -65,6 +68,18 @@ g "sync"
 running=$(mib "$img")
 echo "image after fstrim (running): $running MiB allocated"
 g "fstrim -v /" 2>&1 | sed 's/^/fstrim \/ (info): /'
+root_img=$MSB_HOME/sandboxes/$name/upper.ext4
+root_base=$(mib "$root_img")
+echo "root image before the root write: $root_base MiB allocated"
+g "head -c 536870912 /dev/urandom > /root-big && sync && rm /root-big && sync" \
+  || { echo "setup: guest root write failed"; exit 2; }
+root_written=$(mib "$root_img")
+echo "root image after 512 MiB written and deleted: $root_written MiB allocated"
+root_out=$(g "fstrim -v /.msb/rootfs/upperfs" 2>&1); root_rc=$?
+echo "fstrim /.msb/rootfs/upperfs: rc=$root_rc: $root_out"
+g "sync"
+root_trimmed=$(mib "$root_img")
+echo "root image after fstrim: $root_trimmed MiB allocated"
 "$msb" stop "$name" >/dev/null 2>&1
 stopped=$(mib "$img")
 echo "image after stop: $stopped MiB allocated"
@@ -75,4 +90,7 @@ ok=0; [ "$trim_rc" -eq 0 ] && ok=1
 case_result fstrim "$ok" "rc=$trim_rc"
 ok=0; [ "$written" -gt 900 ] && [ "$running" -lt 300 ] && [ "$stopped" -lt 300 ] && ok=1
 case_result shrunk "$ok" "written=${written}MiB trimmed=${running}MiB stopped=${stopped}MiB"
+ok=0; [ "$root_rc" -eq 0 ] && [ "$root_written" -gt $((root_base + 400)) ] \
+  && [ "$root_trimmed" -lt $((root_base + 150)) ] && ok=1
+case_result rootdisk "$ok" "rc=$root_rc base=${root_base}MiB written=${root_written}MiB trimmed=${root_trimmed}MiB"
 exit "$fail"
