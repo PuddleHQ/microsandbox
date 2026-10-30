@@ -2936,12 +2936,7 @@ async fn load_or_create_host_key(
     secure_parent: bool,
 ) -> MicrosandboxResult<PrivateKey> {
     if tokio::fs::try_exists(path).await? {
-        set_private_file_permissions(path).await?;
-        let secret = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| MicrosandboxError::Custom(format!("load SSH host key: {e}")))?;
-        return decode_secret_key(&secret, None)
-            .map_err(|e| MicrosandboxError::Custom(format!("load SSH host key: {e}")));
+        return load_host_key(path).await;
     }
 
     if let Some(parent) = path.parent() {
@@ -2959,17 +2954,54 @@ async fn load_or_create_host_key(
     let encoded = key
         .to_openssh(russh::keys::ssh_key::LineEnding::LF)
         .map_err(|e| MicrosandboxError::Custom(format!("encode SSH host key: {e}")))?;
+
+    // Several servers for one sandbox can start at once (one `msb ssh serve` per client, or
+    // one server per connection), and each may find no key. Write the whole key to a private
+    // temporary file, then hard-link it into place: the link is atomic and never replaces a
+    // file, so readers never see a partial key and exactly one key wins. A loser loads it.
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), unique_suffix()));
     let mut open_options = tokio::fs::OpenOptions::new();
     open_options.create_new(true).write(true);
     #[cfg(unix)]
     {
         open_options.mode(0o600);
     }
-    let mut file = open_options.open(path).await?;
-    file.write_all(encoded.as_bytes()).await?;
-    file.flush().await?;
+    let written = async {
+        let mut file = open_options.open(&tmp).await?;
+        file.write_all(encoded.as_bytes()).await?;
+        file.sync_all().await?;
+        set_private_file_permissions(&tmp).await?;
+        MicrosandboxResult::Ok(())
+    }
+    .await;
+    let linked = match written {
+        Ok(()) => tokio::fs::hard_link(&tmp, path).await,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+    };
+    let _ = tokio::fs::remove_file(&tmp).await;
+    match linked {
+        Ok(()) => Ok(key),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_host_key(path).await,
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn load_host_key(path: &Path) -> MicrosandboxResult<PrivateKey> {
     set_private_file_permissions(path).await?;
-    Ok(key)
+    let secret = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| MicrosandboxError::Custom(format!("load SSH host key: {e}")))?;
+    decode_secret_key(&secret, None)
+        .map_err(|e| MicrosandboxError::Custom(format!("load SSH host key: {e}")))
+}
+
+/// A per-process counter, so two tasks of one process never pick the same temporary name.
+fn unique_suffix() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 async fn load_authorized_keys(path: &Path) -> MicrosandboxResult<Vec<String>> {
@@ -3749,6 +3781,42 @@ mod tests {
                 let permissions = tokio::fs::metadata(path).await.unwrap().permissions();
                 assert_eq!(permissions.mode() & 0o777, mode);
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_use_of_a_host_key_yields_one_key() {
+        for round in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = std::sync::Arc::new(dir.path().join("ssh/host_ed25519"));
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+            let tasks: Vec<_> = (0..16)
+                .map(|_| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        load_or_create_host_key(&path, true).await
+                    })
+                })
+                .collect();
+            let mut keys = Vec::new();
+            for task in tasks {
+                keys.push(
+                    task.await.unwrap().unwrap_or_else(|e| {
+                        panic!("round {round}: a concurrent caller failed: {e}")
+                    }),
+                );
+            }
+            assert!(
+                keys.iter().all(|k| k.public_key() == keys[0].public_key()),
+                "round {round}: callers got different keys"
+            );
+            let mut names = Vec::new();
+            let mut entries = tokio::fs::read_dir(path.parent().unwrap()).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                names.push(entry.file_name());
+            }
+            assert_eq!(names, vec![std::ffi::OsString::from("host_ed25519")]);
         }
     }
 
