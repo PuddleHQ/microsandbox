@@ -2,7 +2,7 @@
 # mirror) on a hosted Linux runner with KVM (puddle T-155). Fork-only file; puddle-release.yml calls it as a gate (its `ref`: the tag; the stock control only reports).
 #
 # Builds msb for Linux from this commit (optionally against another TijsVK/libkrun commit) and runs
-# tests/puddle/vsock-tail.sh against it in a real microVM. The same cases also run against
+# tests/puddle/vsock-tail.sh and tests/puddle/vsock-large-write.sh against it in a real microVM. The same cases also run against
 # upstream's stock release as a control (msb_krun 0.1.40 on v0.7.7: no libkrun #152).
 #
 # A libkrun change can also be tried by pushing a vsock-tail/<name> branch whose Cargo.toml and
@@ -22,6 +22,7 @@ on:
     paths:
       - .github/workflows/puddle-vsock-tail.yml
       - tests/puddle/vsock-tail.*
+      - tests/puddle/vsock-large-write.*
       - Cargo.lock
   workflow_call:
     inputs:
@@ -223,10 +224,28 @@ jobs:
           fi
           exit "$code"
 
+      - name: Large writes (4 to 128 KiB per send call)
+        if: ${{ !cancelled() && steps.kvm.outputs.run == 'true' }}
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+          VSOCK_LARGE_WRITE_NAME: large-write-${{ matrix.runtime }}
+        run: |
+          set +e -uo pipefail
+          chmod +x rt/msb
+          bash tests/puddle/vsock-large-write.sh rt "$RUNNER_TEMP/lw" 2>&1 | tee "$RUNNER_TEMP/large-write.log"
+          code=${PIPESTATUS[0]}
+          echo "vsock-large-write.sh exit $code"
+          if [ "$RUNTIME" = stock ]; then
+            [ "$code" -ne 2 ] || exit 1
+            exit 0
+          fi
+          exit "$code"
+
       - name: Keep logs
         if: ${{ !cancelled() && steps.kvm.outputs.run == 'true' }}
         run: |
           mkdir -p keep
+          cp "$RUNNER_TEMP/large-write.log" "$RUNNER_TEMP"/lw/*.log "$RUNNER_TEMP"/lw/*.out "$RUNNER_TEMP"/lw/*.err keep/ 2>/dev/null || true
           cp "$RUNNER_TEMP/tail.log" "$RUNNER_TEMP"/w/*.log "$RUNNER_TEMP"/w/*.jsonl keep/ 2>/dev/null || true
           find "$RUNNER_TEMP/w/home" -path '*/logs/*' -name '*.log' -exec cp --parents {} keep/ \; 2>/dev/null || true
 
