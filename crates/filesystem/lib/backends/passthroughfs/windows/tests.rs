@@ -3435,3 +3435,85 @@ fn no_symlink_root_refuses_a_name_win32_would_rewrite() {
     // Written as a `\\?\` path, the same directory is mounted as itself.
     build_no_symlink(dotted).expect("a verbatim root is literal");
 }
+
+#[test]
+fn a_real_name_differing_only_by_case_is_not_an_alias() {
+    let (_temp, root) = canonical_temp();
+    // Real names with the shape of a short name, written in upper case on disk.
+    std::fs::write(root.join("PROGRA~1"), b"a").unwrap();
+    std::fs::write(root.join("LONGNA~2.TXT"), b"b").unwrap();
+    // And one written in lower case, asked for in upper case.
+    std::fs::write(root.join("lower~3.dat"), b"c").unwrap();
+    let fs = fs_for(&root);
+    for name in [
+        "lower~3.dat",
+        "LOWER~3.DAT",
+        "PROGRA~1",
+        "progra~1",
+        "Progra~1",
+        "LONGNA~2.TXT",
+        "longna~2.txt",
+    ] {
+        let c_name = std::ffi::CString::new(name).unwrap();
+        fs.lookup(context(), ROOT_INODE, &c_name)
+            .unwrap_or_else(|err| panic!("{name} is a real entry in another case: {err:?}"));
+    }
+}
+
+/// `\\localhost\X$` is the administrative share of drive X, which the hosted runner's
+/// account may open. Returns the root as `\\localhost\X$\...` for a directory on that drive.
+fn unc_path_of(local: &Path) -> PathBuf {
+    let text = local.to_string_lossy();
+    let plain = text.trim_start_matches(r"\\?\");
+    let (drive, rest) = plain.split_at(2);
+    assert!(drive.ends_with(':'), "{plain}");
+    PathBuf::from(format!(r"\\localhost\{}${rest}", &drive[..1]))
+}
+
+#[test]
+fn a_unc_root_mounts_and_serves_files_at_runtime() {
+    let (_temp, base) = canonical_temp();
+    let work = base.join("unc-work");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(work.join("hello.txt"), b"over unc").unwrap();
+    let unc = unc_path_of(&work);
+    if std::fs::metadata(&unc).is_err() {
+        eprintln!("skip: {} is not reachable from this account", unc.display());
+        return;
+    }
+
+    // Both the plain UNC form and the form already written as `\\?\UNC\`.
+    let verbatim_unc = PathBuf::from(format!(
+        r"\\?\UNC\{}",
+        unc.to_string_lossy().trim_start_matches(r"\\")
+    ));
+    for root in [unc, verbatim_unc] {
+        let fs = build_no_symlink(root.clone())
+            .unwrap_or_else(|err| panic!("{} should mount: {err:?}", root.display()));
+        assert!(
+            fs.root.to_string_lossy().starts_with(r"\\?\UNC\localhost\"),
+            "{:?}",
+            fs.root
+        );
+        let entry = fs
+            .lookup(context(), ROOT_INODE, c"hello.txt")
+            .unwrap_or_else(|err| panic!("lookup under {}: {err:?}", root.display()));
+        assert_eq!(entry.attr.st_size, 8);
+        // A name the share refuses is still refused under a UNC root.
+        expect_errno(fs.lookup(context(), ROOT_INODE, c"nul.txt"), LINUX_EPERM);
+        // A create under the UNC root reaches the host directory.
+        fs.create(
+            context(),
+            ROOT_INODE,
+            c"made.txt",
+            S_IFREG | 0o644,
+            false,
+            (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+            0,
+            Extensions::default(),
+        )
+        .expect("create under a UNC root");
+        assert!(work.join("made.txt").exists());
+        std::fs::remove_file(work.join("made.txt")).unwrap();
+    }
+}
