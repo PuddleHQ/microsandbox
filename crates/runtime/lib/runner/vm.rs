@@ -2995,9 +2995,13 @@ pub(crate) const BOOTSTRAP_MOUNTPOINTS: [&str; 5] = ["dev", "sys", "proc", ".msb
 /// provider must recreate the same pathname namespace before backend restore.
 #[cfg(unix)]
 fn bootstrap_trampoline_backend(limit: usize) -> RuntimeResult<PassthroughFs> {
+    sweep_orphan_bootstrap_roots(&std::env::temp_dir(), BOOTSTRAP_ROOT_SWEEP_MIN_AGE);
     let trampoline = tempfile::Builder::new()
-        .prefix("msb-bootstrap-root-")
+        .prefix(BOOTSTRAP_ROOT_PREFIX)
         .tempdir()?;
+    // The lock marks the folder as owned by this process; the kernel drops it when the process
+    // dies, however it dies, which is what lets a later start tell a live folder from a leaked one.
+    let lock = lock_bootstrap_root(trampoline.path())?;
     for directory in BOOTSTRAP_MOUNTPOINTS {
         std::fs::create_dir(trampoline.path().join(directory)).map_err(|error| {
             RuntimeError::Custom(format!("create bootstrap mountpoint {directory}: {error}"))
@@ -3017,13 +3021,87 @@ fn bootstrap_trampoline_backend(limit: usize) -> RuntimeResult<PassthroughFs> {
     BOOTSTRAP_ROOTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(trampoline.keep());
+        .push((trampoline.keep(), lock));
     Ok(backend)
 }
 
 /// Host folders of the bootstrap roots this process created, removed when it ends.
 #[cfg(unix)]
-static BOOTSTRAP_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static BOOTSTRAP_ROOTS: std::sync::Mutex<Vec<(PathBuf, std::fs::File)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Name prefix of the host folder that backs a bootstrap root.
+#[cfg(unix)]
+const BOOTSTRAP_ROOT_PREFIX: &str = "msb-bootstrap-root-";
+
+/// A folder younger than this is never swept: its owner may not have taken the lock yet.
+#[cfg(unix)]
+const BOOTSTRAP_ROOT_SWEEP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Take an exclusive `flock` on the folder and keep the descriptor open for as long as the
+/// process lives (the lock belongs to the open file description, so `_exit()` and `SIGKILL` both
+/// release it).
+#[cfg(unix)]
+fn lock_bootstrap_root(path: &Path) -> RuntimeResult<std::fs::File> {
+    let dir = std::fs::File::open(path)?;
+    flock_exclusive_nonblocking(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn flock_exclusive_nonblocking(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is open for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Remove bootstrap root folders in `temp_dir` whose owner process is gone (it was killed or the
+/// host lost power before `remove_bootstrap_roots` ran). A folder counts as orphaned when it is
+/// a real directory of the current user, at least `min_age` old, and its lock is free. Best
+/// effort: anything unreadable is skipped, and a failed removal is logged, never raised.
+#[cfg(unix)]
+fn sweep_orphan_bootstrap_roots(temp_dir: &Path, min_age: std::time::Duration) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(entries) = std::fs::read_dir(temp_dir) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(BOOTSTRAP_ROOT_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let old_enough = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if !meta.is_dir() || meta.uid() != uid || !old_enough {
+            continue;
+        }
+        let Ok(dir) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if flock_exclusive_nonblocking(&dir).is_err() {
+            continue; // a live sandbox holds it
+        }
+        // The lock is held while the folder goes, so no second sweep removes it at the same time.
+        remove_folders(vec![path]);
+    }
+}
 
 /// Remove the bootstrap root folders (and whatever the guest wrote into them). Best effort: a
 /// folder that is already gone is fine, and a failure is logged, never raised.
@@ -3034,7 +3112,8 @@ pub(crate) fn remove_bootstrap_roots() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     );
-    remove_folders(roots);
+    // The locks are released when the files drop, after the folders are gone.
+    remove_folders(roots.iter().map(|(path, _)| path.clone()).collect());
 }
 
 #[cfg(unix)]
@@ -4400,7 +4479,7 @@ mod tests {
             .lock()
             .unwrap()
             .last()
-            .cloned()
+            .map(|(path, _)| path.clone())
             .expect("the backend registers its folder");
         assert!(folder.join("newroot").is_dir());
 
@@ -4455,9 +4534,84 @@ mod tests {
         super::BOOTSTRAP_ROOTS
             .lock()
             .unwrap()
-            .retain(|registered| registered != &folder);
+            .retain(|(path, _)| path != &folder);
         super::remove_folders(vec![folder.clone(), folder.clone()]);
         assert!(!folder.exists(), "the folder is removed, twice is fine");
+    }
+
+    /// A bootstrap root folder with a guest file in it, in `parent`.
+    #[cfg(unix)]
+    fn bootstrap_folder(parent: &Path, name: &str) -> PathBuf {
+        let folder = parent.join(format!("{}{name}", super::BOOTSTRAP_ROOT_PREFIX));
+        std::fs::create_dir_all(folder.join("newroot")).unwrap();
+        std::fs::write(folder.join("guest-file"), b"data").unwrap();
+        folder
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_a_folder_whose_owner_is_gone_and_keeps_every_other() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let orphan = bootstrap_folder(temp.path(), "orphan");
+        let live = bootstrap_folder(temp.path(), "live");
+        let stranger = temp.path().join("other-thing");
+        std::fs::create_dir(&stranger).unwrap();
+        let lookalike_file = temp
+            .path()
+            .join(format!("{}file", super::BOOTSTRAP_ROOT_PREFIX));
+        std::fs::write(&lookalike_file, b"x").unwrap();
+        let link_target = tempfile::tempdir().unwrap();
+        std::fs::write(link_target.path().join("keep"), b"x").unwrap();
+        let link = temp
+            .path()
+            .join(format!("{}link", super::BOOTSTRAP_ROOT_PREFIX));
+        std::os::unix::fs::symlink(link_target.path(), &link).unwrap();
+
+        // `live` is held the way a running sandbox holds its folder.
+        let held = super::lock_bootstrap_root(&live).unwrap();
+
+        super::sweep_orphan_bootstrap_roots(temp.path(), Duration::ZERO);
+
+        assert!(
+            !orphan.exists(),
+            "an unlocked folder is removed with its contents"
+        );
+        assert!(live.join("guest-file").exists(), "a locked folder stays");
+        assert!(stranger.exists(), "a folder with another name stays");
+        assert!(lookalike_file.exists(), "a file with the prefix stays");
+        assert!(
+            link_target.path().join("keep").exists(),
+            "a symlink is never followed"
+        );
+
+        // The owner goes away (a kill closes the descriptor): the next sweep takes the folder.
+        drop(held);
+        super::sweep_orphan_bootstrap_roots(temp.path(), Duration::ZERO);
+        assert!(!live.exists(), "the folder goes once its lock is free");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_keeps_a_folder_younger_than_the_minimum_age() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fresh = bootstrap_folder(temp.path(), "fresh");
+        super::sweep_orphan_bootstrap_roots(temp.path(), Duration::from_secs(3600));
+        assert!(fresh.exists(), "its owner may not have locked it yet");
+        super::sweep_orphan_bootstrap_roots(temp.path(), Duration::ZERO);
+        assert!(!fresh.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_lock_on_a_held_folder_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = bootstrap_folder(temp.path(), "held");
+        let _held = super::lock_bootstrap_root(&folder).unwrap();
+        assert!(super::lock_bootstrap_root(&folder).is_err());
     }
 
     #[test]

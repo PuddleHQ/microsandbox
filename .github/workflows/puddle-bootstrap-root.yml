@@ -1,0 +1,128 @@
+# puddle fork: the bootstrap root's host folder (msb-bootstrap-root-*) is removed at a normal stop and at
+# a failed start, and a SIGKILLed sandbox's folder is swept by the next start, on a hosted Linux runner
+# with KVM. Fork-only file.
+#
+# Builds agentd (musl) and msb for Linux from this commit and runs tests/puddle/bootstrap-root.sh with a
+# private TMPDIR: running, stopped, failed, killed and swept cases (see the script header).
+#
+#   gh workflow run puddle-bootstrap-root.yml -R TijsVK/microsandbox --ref <branch>
+name: puddle bootstrap root
+
+on:
+  push:
+    branches:
+      - task/t925-**
+      - bootstrap-root/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: superradcompany/microsandbox
+
+jobs:
+  build:
+    name: Build agentd + msb (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Upstream release of this fork version
+        id: up
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "tag=v${version%%-puddle.*}" >> "$GITHUB_OUTPUT"
+          echo "fork version $version, upstream v${version%%-puddle.*}"
+
+      - name: libkrunfw from upstream ${{ steps.up.outputs.tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$UPSTREAM_REPO" -D dl -p checksums.sha256 -p libkrunfw-linux-x86_64.so
+          bash .github/puddle/verify-asset.sh dl/checksums.sha256 dl/libkrunfw-linux-x86_64.so libkrunfw-linux-x86_64.so
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          shared-key: puddle-msb-linux
+
+      # The guest agent from this commit's source: its per-client limit must match the msb that embeds it.
+      - name: Build agentd, then msb with it embedded
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -y -q libcap-ng-dev musl-tools
+          cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target-dir target-agentd \
+            --target x86_64-unknown-linux-musl
+          mkdir -p embed rt
+          cp target-agentd/x86_64-unknown-linux-musl/release/agentd embed/agentd
+          MSB_EMBED_ARTIFACTS_DIR="$PWD/embed" cargo build --locked --release --no-default-features \
+            --features embed-binaries,net,ssh -p microsandbox-cli
+          fw=$(sed -n 's/.*LIBKRUNFW_VERSION: &str = "\(.*\)";/\1/p' crates/utils/lib/lib.rs)
+          cp target/release/msb rt/msb
+          cp dl/libkrunfw-linux-x86_64.so "rt/libkrunfw.so.$fw"
+          ./rt/msb --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-linux
+          path: rt/
+          compression-level: 1
+
+  bootstrap-root:
+    name: bootstrap root folder
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+
+      - name: KVM
+        run: |
+          set -euo pipefail
+          [ -e /dev/kvm ] || { echo "::error::/dev/kvm is missing on this runner (infrastructure)"; exit 1; }
+          # Hosted runners ship /dev/kvm root-only; open it to the runner user.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: msb-linux
+          path: rt
+
+      - name: Run the cases
+        run: |
+          set +e -uo pipefail
+          chmod +x rt/msb
+          bash tests/puddle/bootstrap-root.sh rt "$RUNNER_TEMP/w" 2>&1 | tee "$RUNNER_TEMP/broot.log"
+          code=${PIPESTATUS[0]}
+          echo "bootstrap-root.sh exit $code"
+          exit "$code"
+
+      - name: Keep logs
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p keep
+          cp "$RUNNER_TEMP/broot.log" "$RUNNER_TEMP"/w/*.log keep/ 2>/dev/null || true
+          find "$RUNNER_TEMP/w/home" -path '*/logs/*' -name '*.log' -exec cp --parents {} keep/ \; 2>/dev/null || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: bootstrap-root
+          path: keep/

@@ -703,7 +703,8 @@ mod tests {
                 .collect(),
         };
         let bytes = serde_json::to_vec(&state).unwrap();
-        let restored = AgentBootstrapFs::decode_mobility_state(&bytes, MAX_MOBILITY_STATE_BYTES).unwrap();
+        let restored =
+            AgentBootstrapFs::decode_mobility_state(&bytes, MAX_MOBILITY_STATE_BYTES).unwrap();
         assert_eq!(
             restored.lookup(ROOT_INODE, b"dev").unwrap(),
             dirs.lookup(ROOT_INODE, b"dev").unwrap()
