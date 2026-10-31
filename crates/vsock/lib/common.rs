@@ -17,7 +17,11 @@ use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-pub(crate) const DEFAULT_MAX_ACTIVE_PEERS: usize = 256;
+/// Connections one route holds open at once. The Puddle agent opens at most 64 sessions, one
+/// connection each, so no normal guest reaches this. A guest that opens connections in a loop
+/// costs the host a descriptor or two and a socket buffer per connection, bounded by this number
+/// times the per-connection buffer in libkrun.
+pub(crate) const DEFAULT_MAX_ACTIVE_PEERS: usize = 128;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -133,4 +137,30 @@ pub(crate) fn nonblocking_unix_socket(socket_type: SockType) -> io::Result<Owned
     }
 
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A guest that opens connections in a loop is refused at exactly the cap and gets room back
+    /// as connections close. The number is spelled out so raising the constant fails here.
+    #[test]
+    fn a_connection_flood_stops_at_the_default_cap() {
+        assert_eq!(DEFAULT_MAX_ACTIVE_PEERS, 128);
+        let limit = PeerLimit::new(DEFAULT_MAX_ACTIVE_PEERS);
+        let mut held = Vec::new();
+        let mut opened = 0usize;
+        while let Ok(lease) = limit.acquire() {
+            held.push(lease);
+            opened += 1;
+            assert!(opened <= 1 << 12, "the limit never refused");
+        }
+        assert_eq!(opened, 128);
+        held.pop();
+        assert!(
+            limit.acquire().is_ok(),
+            "a closed connection frees its slot"
+        );
+    }
 }
