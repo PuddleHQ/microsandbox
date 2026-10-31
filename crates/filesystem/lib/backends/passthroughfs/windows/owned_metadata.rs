@@ -153,27 +153,7 @@ pub(super) fn write_retained_stat(data: &InodeData, stat: OverrideStat) -> io::R
 pub(in crate::backends::passthroughfs) fn owned_component(name: &str) -> io::Result<OsString> {
     // Win32 aliases trailing dots/spaces and device basenames, even with an extension.
     // Refuse them in imported inventories instead of materializing a different namespace.
-    let basename = name.split('.').next().unwrap_or_default();
-    let upper = basename.to_ascii_uppercase();
-    let numbered_device = upper
-        .strip_prefix("COM")
-        .or_else(|| upper.strip_prefix("LPT"))
-        .is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        });
-    if name.ends_with(['.', ' '])
-        || name
-            .chars()
-            .any(|ch| ch.is_control() || "<>\"|?*".contains(ch))
-        || matches!(
-            upper.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-        )
-        || numbered_device
-    {
+    if super::win32_name_refused(name) {
         return Err(linux_error(LINUX_EINVAL));
     }
     let name = std::ffi::CString::new(name).map_err(|_| linux_error(LINUX_EINVAL))?;

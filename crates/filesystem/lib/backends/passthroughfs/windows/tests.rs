@@ -3485,3 +3485,318 @@ fn dax_namespace_change_keeps_mapping(replace: bool, fail_refresh: bool) {
     .unwrap();
     assert!(seen.lock().unwrap().is_empty());
 }
+
+//--------------------------------------------------------------------------------------------------
+// Win32 share names
+//--------------------------------------------------------------------------------------------------
+
+/// A canonical (`\\?\`) copy of the temp dir, so later paths hold no 8.3 short name.
+fn canonical_temp() -> (TempDir, PathBuf) {
+    let temp = TempDir::new();
+    let canonical = std::fs::canonicalize(&temp.path).unwrap();
+    (temp, canonical)
+}
+
+fn short_path_of(path: &Path) -> Option<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut buffer = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buffer` is as long as the length passed.
+    let len = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    if len == 0 || len as usize > buffer.len() {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(&buffer[..len as usize])))
+}
+
+#[test]
+fn win32_names_the_share_refuses() {
+    for name in [
+        c"CON",
+        c"con",
+        c"NUL",
+        c"Prn",
+        c"aux",
+        c"COM1",
+        c"com9",
+        c"COM0",
+        c"LPT3",
+        c"COM\xc2\xb9",
+        c"CON.txt",
+        c"nul.tar.gz",
+        c"con .txt",
+        c"CONIN$",
+        c"CONOUT$",
+        c"dir.",
+        c"name ",
+        c"a*b",
+        c"a?b",
+        c"a<b",
+        c"quote\"d",
+        c"pipe|d",
+        c"ctl\x01",
+    ] {
+        expect_errno(validate_component(name), LINUX_EPERM);
+    }
+}
+
+#[test]
+fn win32_names_the_share_keeps() {
+    for name in [
+        c"console",
+        c"com10",
+        c"COM",
+        c"LPT",
+        c"comma.txt",
+        c"a.b",
+        c".hidden",
+        c"..hidden",
+        c"backup~1.txt",
+        c"con-tent",
+        c"x.con",
+    ] {
+        assert!(
+            validate_component(name).is_ok(),
+            "{name:?} must stay usable"
+        );
+    }
+}
+
+#[test]
+fn guest_cannot_look_up_or_create_a_device_name() {
+    let (_temp, root) = canonical_temp();
+    let fs = fs_for(&root);
+    for name in [c"NUL", c"CON", c"com1", c"nul.txt", c"dot."] {
+        expect_errno(fs.lookup(context(), ROOT_INODE, name), LINUX_EPERM);
+        expect_errno(
+            fs.create(
+                context(),
+                ROOT_INODE,
+                name,
+                S_IFREG | 0o644,
+                false,
+                (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+                0,
+                Extensions::default(),
+            ),
+            LINUX_EPERM,
+        );
+        expect_errno(
+            fs.mkdir(context(), ROOT_INODE, name, 0o755, 0, Extensions::default()),
+            LINUX_EPERM,
+        );
+    }
+    // Nothing named like a device or with a trailing dot reached the host.
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn listing_skips_a_host_entry_the_share_refuses() {
+    let (_temp, root) = canonical_temp();
+    // Only a `\\?\` path can make such entries on the host.
+    std::fs::write(root.join("trailing."), b"x").unwrap();
+    std::fs::write(root.join("aux"), b"x").unwrap();
+    std::fs::write(root.join("fine.txt"), b"x").unwrap();
+    let fs = fs_for(&root);
+    let names = list_root_names(&fs);
+    assert!(names.contains(&"fine.txt".to_string()), "{names:?}");
+    assert!(!names.contains(&"aux".to_string()), "{names:?}");
+    assert!(!names.contains(&"trailing.".to_string()), "{names:?}");
+}
+
+fn list_root_names(fs: &PassthroughFs) -> Vec<String> {
+    fs.dir_entries(ROOT_INODE)
+        .unwrap()
+        .into_iter()
+        .map(|(entry, _)| String::from_utf8(entry.name.to_vec()).unwrap())
+        .collect()
+}
+
+#[test]
+fn guest_cannot_reach_a_file_through_its_short_name() {
+    let (_temp, root) = canonical_temp();
+    let long = root.join("a-rather-long-file-name.txt");
+    std::fs::write(&long, b"secret").unwrap();
+    let short = short_path_of(&long).and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    });
+    let Some(short) =
+        short.filter(|short| !short.eq_ignore_ascii_case("a-rather-long-file-name.txt"))
+    else {
+        // The volume has no 8.3 names, so there is no alias to refuse.
+        eprintln!("skip: 8.3 short names are off on this volume");
+        return;
+    };
+    let fs = fs_for(&root);
+    fs.lookup(context(), ROOT_INODE, c"a-rather-long-file-name.txt")
+        .expect("the long name stays usable");
+    let alias = std::ffi::CString::new(short.clone()).unwrap();
+    expect_errno(fs.lookup(context(), ROOT_INODE, &alias), LINUX_EPERM);
+    let lower = std::ffi::CString::new(short.to_lowercase()).unwrap();
+    expect_errno(fs.lookup(context(), ROOT_INODE, &lower), LINUX_EPERM);
+}
+
+#[test]
+fn a_real_name_shaped_like_a_short_name_stays_usable() {
+    let (_temp, root) = canonical_temp();
+    std::fs::write(root.join("backup~1.txt"), b"mine").unwrap();
+    let fs = fs_for(&root);
+    fs.lookup(context(), ROOT_INODE, c"backup~1.txt")
+        .expect("a file really called backup~1.txt");
+    // A name that does not exist is not found, and may be created.
+    expect_errno(
+        fs.lookup(context(), ROOT_INODE, c"other~7.txt"),
+        LINUX_ENOENT,
+    );
+    fs.create(
+        context(),
+        ROOT_INODE,
+        c"other~7.txt",
+        S_IFREG | 0o644,
+        false,
+        (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+        0,
+        Extensions::default(),
+    )
+    .expect("create under a short-name-shaped name");
+}
+
+#[test]
+fn verbatim_root_prefixes_and_refuses() {
+    let root = verbatim_root(Path::new(r"C:\Users\someone\share")).unwrap();
+    assert_eq!(root, Path::new(r"\\?\C:\Users\someone\share"));
+    let unc = verbatim_root(Path::new(r"\\server\share\dir")).unwrap();
+    assert_eq!(unc, Path::new(r"\\?\UNC\server\share\dir"));
+    let already = verbatim_root(Path::new(r"\\?\C:\Users\dir.")).unwrap();
+    assert_eq!(already, Path::new(r"\\?\C:\Users\dir."), "taken as written");
+    let relative = verbatim_root(Path::new("some-dir")).unwrap();
+    assert!(
+        relative.to_string_lossy().starts_with(r"\\?\"),
+        "{relative:?}"
+    );
+
+    for refused in [
+        r"C:\Users\CON",
+        r"C:\share\nul.txt",
+        r"C:\share\dir.",
+        r"C:\share\dir ",
+        r"\\.\C:",
+    ] {
+        expect_errno(verbatim_root(Path::new(refused)), LINUX_EINVAL);
+    }
+}
+
+#[test]
+fn no_symlink_root_is_resolved_as_a_verbatim_path() {
+    let (_temp, base) = canonical_temp();
+    let work = base.join("work");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(work.join("hello.txt"), b"data").unwrap();
+    // The same directory without its `\\?\` prefix.
+    let plain = PathBuf::from(work.to_string_lossy().trim_start_matches(r"\\?\"));
+    assert!(!plain.to_string_lossy().starts_with(r"\\"), "{plain:?}");
+
+    let fs = build_no_symlink(plain).unwrap();
+    assert!(
+        fs.root.to_string_lossy().starts_with(r"\\?\"),
+        "{:?}",
+        fs.root
+    );
+    fs.lookup(context(), ROOT_INODE, c"hello.txt").unwrap();
+}
+
+#[test]
+fn no_symlink_root_refuses_a_name_win32_would_rewrite() {
+    let (_temp, base) = canonical_temp();
+    // Only a `\\?\` path can create this directory. Win32 would open `dotted` for `dotted.`.
+    let dotted = base.join("dotted.");
+    std::fs::create_dir(&dotted).unwrap();
+    let plain = PathBuf::from(dotted.to_string_lossy().trim_start_matches(r"\\?\"));
+
+    expect_errno(build_no_symlink(plain).map(|_| ()), LINUX_EINVAL);
+    // Written as a `\\?\` path, the same directory is mounted as itself.
+    build_no_symlink(dotted).expect("a verbatim root is literal");
+}
+
+#[test]
+fn a_real_name_differing_only_by_case_is_not_an_alias() {
+    let (_temp, root) = canonical_temp();
+    // Real names with the shape of a short name, written in upper case on disk.
+    std::fs::write(root.join("PROGRA~1"), b"a").unwrap();
+    std::fs::write(root.join("LONGNA~2.TXT"), b"b").unwrap();
+    // And one written in lower case, asked for in upper case.
+    std::fs::write(root.join("lower~3.dat"), b"c").unwrap();
+    let fs = fs_for(&root);
+    for name in [
+        "lower~3.dat",
+        "LOWER~3.DAT",
+        "PROGRA~1",
+        "progra~1",
+        "Progra~1",
+        "LONGNA~2.TXT",
+        "longna~2.txt",
+    ] {
+        let c_name = std::ffi::CString::new(name).unwrap();
+        fs.lookup(context(), ROOT_INODE, &c_name)
+            .unwrap_or_else(|err| panic!("{name} is a real entry in another case: {err:?}"));
+    }
+}
+
+/// `\\localhost\X$` is the administrative share of drive X, which the hosted runner's
+/// account may open. Returns the root as `\\localhost\X$\...` for a directory on that drive.
+fn unc_path_of(local: &Path) -> PathBuf {
+    let text = local.to_string_lossy();
+    let plain = text.trim_start_matches(r"\\?\");
+    let (drive, rest) = plain.split_at(2);
+    assert!(drive.ends_with(':'), "{plain}");
+    PathBuf::from(format!(r"\\localhost\{}${rest}", &drive[..1]))
+}
+
+#[test]
+fn a_unc_root_mounts_and_serves_files_at_runtime() {
+    let (_temp, base) = canonical_temp();
+    let work = base.join("unc-work");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(work.join("hello.txt"), b"over unc").unwrap();
+    let unc = unc_path_of(&work);
+    if std::fs::metadata(&unc).is_err() {
+        eprintln!("skip: {} is not reachable from this account", unc.display());
+        return;
+    }
+
+    // Both the plain UNC form and the form already written as `\\?\UNC\`.
+    let verbatim_unc = PathBuf::from(format!(
+        r"\\?\UNC\{}",
+        unc.to_string_lossy().trim_start_matches(r"\\")
+    ));
+    for root in [unc, verbatim_unc] {
+        let fs = build_no_symlink(root.clone())
+            .unwrap_or_else(|err| panic!("{} should mount: {err:?}", root.display()));
+        assert!(
+            fs.root.to_string_lossy().starts_with(r"\\?\UNC\localhost\"),
+            "{:?}",
+            fs.root
+        );
+        let entry = fs
+            .lookup(context(), ROOT_INODE, c"hello.txt")
+            .unwrap_or_else(|err| panic!("lookup under {}: {err:?}", root.display()));
+        assert_eq!(entry.attr.st_size, 8);
+        // A name the share refuses is still refused under a UNC root.
+        expect_errno(fs.lookup(context(), ROOT_INODE, c"nul.txt"), LINUX_EPERM);
+        // A create under the UNC root reaches the host directory.
+        fs.create(
+            context(),
+            ROOT_INODE,
+            c"made.txt",
+            S_IFREG | 0o644,
+            false,
+            (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+            0,
+            Extensions::default(),
+        )
+        .expect("create under a UNC root");
+        assert!(work.join("made.txt").exists());
+        std::fs::remove_file(work.join("made.txt")).unwrap();
+    }
+}

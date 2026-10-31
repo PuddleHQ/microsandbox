@@ -33,6 +33,7 @@ mod inode;
 mod memory_mapping;
 mod metadata;
 mod mobility;
+mod names;
 mod ops;
 mod owned_metadata;
 mod remove_ops;
@@ -40,6 +41,7 @@ mod stat_store;
 
 use dax::{DaxFiles, DaxWindows};
 use inode::{DirHandle, DirSnapshotEntry, HandleData, InodeData, InodeTable};
+use names::{refuse_short_name_alias, verbatim_root, win32_name_refused};
 pub(super) use owned_metadata::{
     capture_owned_metadata, clear_owned_payload_metadata, owned_component, restore_owned_metadata,
 };
@@ -267,6 +269,7 @@ fn validate_component(name: &CStr) -> io::Result<&str> {
         || component.contains('\\')
         || component.contains(':')
         || is_reserved_name(component)
+        || win32_name_refused(component)
     {
         return Err(linux_error(LINUX_EPERM));
     }
@@ -314,9 +317,13 @@ fn resolve_root_no_reparse(root_dir: &Path) -> io::Result<PathBuf> {
         return Err(linux_error(LINUX_EINVAL));
     }
 
-    // Split into the trusted base and the segments below it. For an absolute
-    // path the base is the volume root (prefix + root); for a relative path it
-    // is the working directory. Neither is attacker-controllable.
+    // Walk a `\\?\` path, so Win32 reads no name below the volume root: `CON` is a
+    // directory and a trailing dot is part of the name. `verbatim_root` also refuses a
+    // path whose names Win32 would otherwise rewrite.
+    let root_dir = verbatim_root(root_dir)?;
+
+    // Split into the trusted base and the segments below it: the volume root
+    // (prefix + root). It is not attacker-controllable.
     let mut cursor = PathBuf::new();
     let mut names = Vec::new();
     for component in root_dir.components() {
@@ -326,9 +333,6 @@ fn resolve_root_no_reparse(root_dir: &Path) -> io::Result<PathBuf> {
             Component::CurDir => {}
             Component::ParentDir => return Err(linux_error(LINUX_EINVAL)),
         }
-    }
-    if cursor.as_os_str().is_empty() {
-        cursor.push(".");
     }
 
     // Descend one component at a time; each ancestor is verified non-reparse
