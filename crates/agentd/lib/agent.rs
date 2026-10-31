@@ -3172,16 +3172,21 @@ async fn handle_message_with_charge(
         }
 
         MessageType::Shutdown => {
-            // Graceful shutdown — signal all sessions, then ask the guest
-            // kernel to power off so block-root filesystems can shut down
-            // cleanly instead of leaving ext4 journal recovery pending.
+            // Graceful shutdown, then ask the guest kernel to power off so
+            // block-root filesystems can shut down cleanly instead of leaving
+            // ext4 journal recovery pending. As PID 1, the poweroff path gives
+            // every process (sessions included) one SIGTERM and a grace
+            // period; under a foreign init only the sessions get it here.
+            let signal_sessions = !crate::handoff::is_pid_1();
             for session in state
                 .sessions
                 .drain()
                 .map(|(_, session)| session)
                 .chain(state.detached_sessions.drain().map(|(_, session)| session))
             {
-                let _ = session.send_signal(15); // SIGTERM
+                if signal_sessions {
+                    let _ = session.send_signal(15); // SIGTERM
+                }
             }
             state.write_sessions.clear();
             for (_, worker) in state.bulk_write_workers.drain() {

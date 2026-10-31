@@ -18,11 +18,23 @@ use nix::mount::{self, MntFlags, MsFlags};
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-/// Budget for the whole teardown pass.
+/// Budget for the teardown pass after the processes are gone.
 ///
-/// Must stay comfortably inside `microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT` (2s): the host hard-kills the VMM when that window expires, so a
-/// slow teardown would turn a graceful stop into the very unclean shutdown it is trying to prevent.
+/// With [`GUEST_TERM_GRACE`] it must stay comfortably inside `microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT`: a host lifetime policy
+/// hard-kills the VMM when that window expires, so a slow teardown would turn a graceful stop into the very unclean shutdown it is trying to prevent.
 const TEARDOWN_DEADLINE: Duration = Duration::from_millis(1000);
+
+/// How long the guest's processes get to exit after their SIGTERM before the rest are killed.
+const GUEST_TERM_GRACE: Duration = microsandbox_protocol::GUEST_TERM_GRACE;
+
+const _: () = assert!(
+    GUEST_TERM_GRACE.as_millis() + TEARDOWN_DEADLINE.as_millis()
+        < microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT.as_millis(),
+    "the grace and the teardown must fit in the host's shutdown window",
+);
+
+/// Most processes still running at the end of [`GUEST_TERM_GRACE`] that the log names.
+const LEFT_NAMED: usize = 16;
 
 /// Sub-budget for waiting on killed processes to exit and release their open files.
 const PROCESS_REAP_BUDGET: Duration = Duration::from_millis(300);
@@ -93,17 +105,18 @@ pub fn register_upper_fs(path: &str) {
 /// Flushes and tears down filesystems ahead of guest poweroff so block-backed mounts reach a clean terminal state (unmounted or read-only with the
 /// journal checkpointed).
 ///
-/// `kill_remaining_processes` should be true only when agentd is PID 1 and about to power the kernel off: lingering processes with write-open files
-/// would otherwise make every read-only remount fail with `EBUSY`. Never fails — the caller must proceed to poweroff regardless.
-pub fn teardown_filesystems(kill_remaining_processes: bool) {
-    let deadline = Instant::now() + TEARDOWN_DEADLINE;
-
+/// `end_remaining_processes` should be true only when agentd is PID 1 and about to power the kernel off: every other process then gets a SIGTERM and
+/// up to [`GUEST_TERM_GRACE`] to exit, and is killed after that; lingering processes with write-open files would otherwise make every read-only
+/// remount fail with `EBUSY`. Never fails — the caller must proceed to poweroff regardless.
+pub fn teardown_filesystems(end_remaining_processes: bool) {
     // SAFETY: sync(2) has no failure modes and takes no arguments.
     unsafe { libc::sync() };
 
-    if kill_remaining_processes {
-        quiesce_processes(deadline);
+    if end_remaining_processes {
+        end_processes();
     }
+
+    let deadline = Instant::now() + TEARDOWN_DEADLINE;
 
     match std::fs::read_to_string("/proc/self/mounts") {
         Ok(table) => {
@@ -219,16 +232,34 @@ fn remount_upper_readonly(deadline: Instant) {
     }
 }
 
-/// Kills every remaining process and briefly waits for them to exit.
+/// Ends every other process the way a machine shuts down: one SIGTERM each (and a SIGCONT, so a stopped process can act on it), up to
+/// [`GUEST_TERM_GRACE`] for them to exit, then SIGKILL for what is left.
 ///
-/// A read-only remount fails with `EBUSY` while any process holds a file open for write, so the mount walk is only reliable once userland is gone.
-/// The graceful SIGTERM already went out in the shutdown handler, and the kernel poweroff that follows would kill everything anyway — this just makes
-/// that death happen before the remounts instead of after. `kill(-1)` never signals the calling process or PID 1, so agentd survives.
-fn quiesce_processes(deadline: Instant) {
+/// The SIGTERM goes to every process, not only the exec sessions: a daemon that left the command that started it (an image's entrypoint such as
+/// dockerd) loses state when it is killed outright. Each process gets one SIGTERM only, because some count them (dockerd quits without cleanup at the
+/// third). `kill(-1)` never signals the calling process or PID 1, so agentd survives. As PID 1, agentd is the parent of every orphan, so "no child
+/// left" means no process is left.
+fn end_processes() {
     // SAFETY: kill(2) with pid -1 is well-defined; failure (e.g. no processes left) is benign.
+    unsafe {
+        libc::kill(-1, libc::SIGTERM);
+        libc::kill(-1, libc::SIGCONT);
+    }
+    if reap_children_until(Instant::now() + GUEST_TERM_GRACE) {
+        return;
+    }
+    eprintln!(
+        "agentd: teardown: still running {}s after SIGTERM, killing: {}",
+        GUEST_TERM_GRACE.as_secs(),
+        left_processes()
+    );
+    // SAFETY: as above.
     unsafe { libc::kill(-1, libc::SIGKILL) };
+    reap_children_until(Instant::now() + PROCESS_REAP_BUDGET);
+}
 
-    let reap_deadline = deadline.min(Instant::now() + PROCESS_REAP_BUDGET);
+/// Reaps exited children until none is left (`true`) or `deadline` passes with some still running (`false`).
+fn reap_children_until(deadline: Instant) -> bool {
     loop {
         // SAFETY: waitpid(2) with WNOHANG and a null status pointer is well-defined.
         let ret = unsafe { libc::waitpid(-1, ptr::null_mut(), libc::WNOHANG) };
@@ -236,9 +267,9 @@ fn quiesce_processes(deadline: Instant) {
             continue;
         }
         if ret == 0 {
-            // Children remain but none exited yet; give SIGKILL a moment to land.
-            if Instant::now() >= reap_deadline {
-                break;
+            // Children remain but none exited yet.
+            if Instant::now() >= deadline {
+                return false;
             }
             std::thread::sleep(PROCESS_REAP_POLL);
             continue;
@@ -247,9 +278,47 @@ fn quiesce_processes(deadline: Instant) {
         if err.raw_os_error() == Some(libc::EINTR) {
             continue;
         }
-        // ECHILD: everything is reaped (or another reaper got there first).
-        break;
+        // ECHILD: no child is left (another reaper may have collected some of them).
+        return true;
     }
+}
+
+/// The user processes still running, as `<pid> <comm>` pairs (at most [`LEFT_NAMED`]), for the log.
+fn left_processes() -> String {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return "(cannot read /proc)".to_owned();
+    };
+    let own = std::process::id();
+    let mut left: Vec<String> = dir
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| pid != own && pid != 1)
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            user_process_name(&stat).map(|comm| format!("{pid} {comm}"))
+        })
+        .collect();
+    left.sort();
+    let more = left.len().saturating_sub(LEFT_NAMED);
+    left.truncate(LEFT_NAMED);
+    let mut text = left.join(", ");
+    if more > 0 {
+        text.push_str(&format!(" and {more} more"));
+    }
+    text
+}
+
+/// The command name from a `/proc/<pid>/stat` line, or `None` for a kernel thread, a zombie or a line it cannot read.
+fn user_process_name(stat: &str) -> Option<&str> {
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let comm = stat.get(open + 1..close)?;
+    // After the name: state, ppid, pgrp, session, tty_nr, tpgid, flags.
+    let mut fields = stat.get(close + 1..)?.split_whitespace();
+    let state = fields.next()?;
+    let flags: u64 = fields.nth(5)?.parse().ok()?;
+    (state != "Z" && flags & PF_KTHREAD == 0).then_some(comm)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -320,5 +389,35 @@ tmpfs /tmp tmpfs rw,nosuid,nodev,relatime,mode=1777 0 0
         let plan = teardown_plan("garbage\n\n/dev/vda\n/dev/vdb /ok ext4 rw 0 0\n");
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].path, Path::new("/ok"));
+    }
+
+    #[test]
+    fn a_user_process_is_named_by_its_stat_line() {
+        // dockerd, sleeping, flags 0x400100 (PF_FORKNOEXEC | PF_RANDOMIZE); the name may hold spaces and parentheses.
+        let stat = "412 (dockerd) S 1 412 412 0 -1 4194560 3012 0 0 0 31 18 0 0 20 0 14 0 214 1838108672 9984";
+        assert_eq!(user_process_name(stat), Some("dockerd"));
+        let odd = "77 (my (odd) name) R 1 77 77 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 5 0 0";
+        assert_eq!(user_process_name(odd), Some("my (odd) name"));
+    }
+
+    #[test]
+    fn kernel_threads_zombies_and_bad_lines_are_not_user_processes() {
+        // kworker: PF_KTHREAD (0x200000) in flags 0x4208060.
+        let kthread = "23 (kworker/0:1) I 2 0 0 0 -1 69238880 0 0 0 0 0 0 0 0 20 0 1 0 9 0 0";
+        assert_eq!(user_process_name(kthread), None);
+        let zombie = "90 (sh) Z 1 90 90 0 -1 4194316 0 0 0 0 0 0 0 0 20 0 1 0 50 0 0";
+        assert_eq!(user_process_name(zombie), None);
+        assert_eq!(user_process_name("90 (sh) S 1"), None);
+        assert_eq!(user_process_name("garbage"), None);
+        assert_eq!(user_process_name(""), None);
+    }
+
+    #[test]
+    fn the_grace_and_the_teardown_fit_in_the_host_window() {
+        assert_eq!(GUEST_TERM_GRACE, Duration::from_secs(10));
+        assert!(
+            GUEST_TERM_GRACE + TEARDOWN_DEADLINE
+                < microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT
+        );
     }
 }

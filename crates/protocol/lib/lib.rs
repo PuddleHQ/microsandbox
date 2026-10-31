@@ -18,7 +18,18 @@ pub mod jobs;
 
 const HANDOFF_POWEROFF_TIMEOUT_SECS: u64 = 5;
 const SHUTDOWN_FLUSH_MARGIN_SECS: u64 = 3;
-const NORMAL_SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 2;
+const GUEST_TERM_GRACE_SECS: u64 = 10;
+const NORMAL_SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = GUEST_TERM_GRACE_SECS + 2;
+
+/// How long the guest's processes get to exit after the SIGTERM of a graceful
+/// shutdown before agentd (as PID 1) kills what is left, the grace `docker stop`
+/// gives a container.
+///
+/// Every process gets the SIGTERM, not only the commands agentd started: a
+/// daemon that left its command (an image's entrypoint such as dockerd) must
+/// also get the chance to save its state.
+pub const GUEST_TERM_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(GUEST_TERM_GRACE_SECS);
 
 /// Base grace used by explicit host lifetime policies for handoff-init sandboxes.
 ///
@@ -35,9 +46,9 @@ pub const SHUTDOWN_FLUSH_MARGIN: std::time::Duration =
 
 /// Explicit lifetime-policy fallback window when agentd remains PID 1.
 ///
-/// agentd can synchronously `sync()`, remount the root read-only, and request
-/// kernel poweroff directly in this mode, so normal development sandboxes
-/// should not pay the longer handoff-init grace.
+/// agentd gives the guest's processes up to [`GUEST_TERM_GRACE`] after their
+/// SIGTERM, then synchronously `sync()`s, remounts the root read-only, and
+/// requests kernel poweroff, all inside this window.
 pub const NORMAL_SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(NORMAL_SHUTDOWN_FLUSH_TIMEOUT_SECS);
 
@@ -59,7 +70,11 @@ pub const HANDOFF_SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration =
 /// handoff init.
 pub const SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration = HANDOFF_SHUTDOWN_FLUSH_TIMEOUT;
 
-// Keep a positive host margin in the explicit lifetime-policy window.
+// Keep a positive host margin in the explicit lifetime-policy windows.
+const _: () = assert!(
+    NORMAL_SHUTDOWN_FLUSH_TIMEOUT.as_secs() > GUEST_TERM_GRACE.as_secs(),
+    "NORMAL_SHUTDOWN_FLUSH_TIMEOUT must exceed GUEST_TERM_GRACE",
+);
 const _: () = assert!(
     HANDOFF_SHUTDOWN_FLUSH_TIMEOUT.as_secs() > HANDOFF_POWEROFF_TIMEOUT.as_secs(),
     "HANDOFF_SHUTDOWN_FLUSH_TIMEOUT must exceed HANDOFF_POWEROFF_TIMEOUT",
