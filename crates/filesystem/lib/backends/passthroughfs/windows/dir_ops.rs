@@ -89,7 +89,8 @@ impl PassthroughFs {
             let entry = entry.map_err(host_error)?;
             let name = entry.file_name();
             let name = name.to_str().ok_or_else(|| linux_error(LINUX_EINVAL))?;
-            if is_reserved_name(name) {
+            // A host entry under a name the share refuses stays out of the listing.
+            if is_reserved_name(name) || win32_name_refused(name) {
                 continue;
             }
             let name_buffer = format!("{name}\0");

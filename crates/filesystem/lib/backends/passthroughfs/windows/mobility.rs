@@ -24,7 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use super::{
     DirHandle, DirSnapshotEntry, HandleData, InodeData, InodeTable, LINUX_O_ACCMODE, PassthroughFs,
     host_error, inode::VirtualMetadata, is_reserved_name, open_options_from_flags,
-    reject_reparse_metadata,
+    reject_reparse_metadata, win32_name_refused,
 };
 use crate::backends::{mobility, passthroughfs::quota::QuotaState};
 
@@ -993,6 +993,7 @@ fn validate_components(components: &[Vec<u16>]) -> io::Result<()> {
             || name == ".."
             || name.contains(['\0', '/', '\\', ':'])
             || is_reserved_name(name)
+            || win32_name_refused(name)
         {
             return Err(invalid_state("invalid passthrough path component"));
         }

@@ -320,6 +320,7 @@ impl PassthroughFs {
     pub(super) fn child_path(&self, parent: u64, name: &CStr) -> io::Result<PathBuf> {
         let name = validate_component(name)?;
         let parent = self.inode(parent)?;
+        refuse_short_name_alias(&parent.path(), name)?;
         Ok(parent.path().join(name))
     }
 
