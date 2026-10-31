@@ -10,6 +10,10 @@ pub(crate) mod quota;
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) mod window;
 
+/// Default for `PassthroughConfig::max_open_handles`. A guest's own tools stay far below this
+/// (a build or a file watcher holds thousands); it only stops a loop that opens files forever.
+pub(crate) const DEFAULT_MAX_OPEN_HANDLES: usize = 65_536;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

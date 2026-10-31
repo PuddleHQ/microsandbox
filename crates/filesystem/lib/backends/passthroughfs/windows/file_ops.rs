@@ -21,6 +21,7 @@ impl PassthroughFs {
             self.quota_ensure_baseline();
         }
 
+        self.ensure_handle_room()?;
         let data = self.inode(inode)?;
         let metadata = self.inode_metadata(&data)?;
         if metadata.file_type().is_dir() {

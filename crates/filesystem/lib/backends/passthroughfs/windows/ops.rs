@@ -449,6 +449,7 @@ impl DynFileSystem for PassthroughFs {
             return Err(linux_error(LINUX_ENOTDIR));
         }
 
+        self.ensure_handle_room()?;
         let data = self.inode(inode)?;
         let metadata = self.safe_metadata(&data.path())?;
         if !metadata.file_type().is_dir() {

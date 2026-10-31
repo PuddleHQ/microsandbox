@@ -85,6 +85,13 @@ pub struct PassthroughConfig {
     /// while accounting only the selected file. `None` uses `root_dir`.
     pub quota_root: Option<PathBuf>,
 
+    /// Most file and directory handles the guest may hold open on this mount at once.
+    ///
+    /// Each handle pins a host descriptor, so a guest that opens files in a loop would
+    /// otherwise use up the sandbox process's descriptors. Past the limit `open`, `create`
+    /// and `opendir` fail with `EMFILE`; handles the guest closes make room again.
+    pub max_open_handles: usize,
+
     /// Guest `(uid, gid)` to present for host files that carry no per-file
     /// override in the metadata store.
     ///
@@ -204,6 +211,15 @@ impl PassthroughFs {
         })
     }
 
+    /// Refuse a new handle with `EMFILE` when the guest already holds `max_open_handles`.
+    pub(super) fn ensure_handle_room(&self) -> io::Result<()> {
+        let open = self.handles.read().unwrap().len() + self.dir_handles.read().unwrap().len();
+        if open >= self.cfg.max_open_handles {
+            return Err(linux_error(LINUX_EMFILE));
+        }
+        Ok(())
+    }
+
     pub(super) fn require_writable(&self) -> io::Result<()> {
         if self.cfg.readonly {
             Err(linux_error(LINUX_EROFS))
@@ -264,6 +280,7 @@ impl Default for PassthroughConfig {
             inject_init: true,
             quota_bytes: None,
             quota_root: None,
+            max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             default_owner: None,
             external_checkpoint: None,
             owned_checkpoint: None,

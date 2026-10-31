@@ -33,6 +33,7 @@ use std::{
     time::Duration,
 };
 
+use super::DEFAULT_MAX_OPEN_HANDLES;
 use crate::{
     AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
     GetxattrReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
@@ -187,6 +188,13 @@ pub struct PassthroughConfig {
     /// Single-file mounts anchor pathname resolution at the parent directory,
     /// while accounting only the selected file. `None` uses `root_dir`.
     pub quota_root: Option<PathBuf>,
+
+    /// Most file and directory handles the guest may hold open on this mount at once.
+    ///
+    /// Each handle pins a host descriptor, so a guest that opens files in a loop would
+    /// otherwise use up the sandbox process's descriptors. Past the limit `open`, `create`
+    /// and `opendir` fail with `EMFILE`; handles the guest closes make room again.
+    pub max_open_handles: usize,
 }
 
 /// Passthrough filesystem backend.
@@ -510,6 +518,18 @@ impl PassthroughFs {
         self.injects_init() && inode == init_binary::INIT_INODE
     }
 
+    /// Refuse a new handle with `EMFILE` when the guest already holds `max_open_handles`.
+    ///
+    /// The check runs before the host file is opened or created. Concurrent opens can overshoot
+    /// the limit by the number of server threads.
+    pub(crate) fn ensure_handle_room(&self) -> io::Result<()> {
+        let open = self.handles.read().unwrap().len() + self.dir_handles.read().unwrap().len();
+        if open >= self.cfg.max_open_handles {
+            return Err(platform::emfile());
+        }
+        Ok(())
+    }
+
     /// Charge the quota for growing an open file to `new_end` bytes.
     pub(crate) fn quota_charge_to(&self, fd: std::os::fd::RawFd, new_end: u64) -> io::Result<()> {
         if let Some(quota) = &self.quota {
@@ -576,6 +596,7 @@ impl Default for PassthroughConfig {
             bind_identity_map: None,
             quota_bytes: None,
             quota_root: None,
+            max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
         }
     }
 }

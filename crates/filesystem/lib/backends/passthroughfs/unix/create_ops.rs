@@ -63,6 +63,7 @@ pub(crate) fn do_create(
     if fs.is_reserved_init_name(parent, name.to_bytes()) {
         return Err(platform::eacces());
     }
+    fs.ensure_handle_room()?;
 
     // Snapshot the quota baseline before creating the file, so the new file's
     // bytes are charged as guest growth rather than absorbed into the baseline.
