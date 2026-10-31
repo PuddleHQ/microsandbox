@@ -56,3 +56,6 @@ __pycache__/
 env/
 venv/
 .venv/
+crates/filesystem/fuzz/target
+crates/filesystem/fuzz/artifacts
+crates/filesystem/fuzz/fuzz-work

@@ -1,7 +1,8 @@
 name: Fuzz
 
 # Nightly coverage-guided fuzzing of the snapshot import record walker
-# (sdk/rust/fuzz). Deliberately not part of per-PR CI: a fixed nightly
+# (sdk/rust/fuzz) and of FUSE requests into the filesystem backends
+# (crates/filesystem/fuzz). Deliberately not part of per-PR CI: a fixed nightly
 # budget on a GitHub-hosted runner finds parser bugs without adding a
 # second of PR latency or touching the shared self-hosted runners.
 
@@ -51,4 +52,40 @@ jobs:
         with:
           name: fuzz-artifacts
           path: sdk/rust/fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # FUSE requests into the filesystem backends (crates/filesystem/fuzz). The default features are
+  # off, so no agentd build is needed.
+  fuzz-fuse:
+    name: Fuzz filesystem backends (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuse_passthrough, fuse_memfs]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch tracks latest
+        with:
+          toolchain: nightly
+
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2
+        with:
+          tool: cargo-fuzz
+
+      # The prebuilt cargo-fuzz may default to a target the runner lacks, so name it.
+      - name: Fuzz ${{ matrix.target }} (10 min budget)
+        working-directory: crates/filesystem/fuzz
+        env:
+          FUZZ_FUSE_ROOT: ${{ runner.temp }}
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz-work seeds/fuse_requests -- -max_total_time=600 -max_len=16384 -rss_limit_mb=2048 -timeout=30
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-fuse-artifacts-${{ matrix.target }}
+          path: crates/filesystem/fuzz/artifacts/
           if-no-files-found: ignore

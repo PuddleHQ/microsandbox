@@ -1,0 +1,48 @@
+[package]
+name = "microsandbox-filesystem-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+microsandbox-filesystem = { path = "..", default-features = false }
+# The fuzzing feature of msb_krun_devices exposes the FUSE dispatcher entry point; the patch
+# below makes the whole msb_krun stack use the libkrun branch that has it.
+msb_krun_devices = { version = "=0.1.41", features = ["fuzzing"] }
+
+# Standalone workspace: the fuzz crate needs nightly and libFuzzer instrumentation and must
+# never affect the normal workspace build.
+[workspace]
+
+[patch.crates-io]
+msb_krun = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_arch = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_arch_gen = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_cpuid = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_devices = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_hvf = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_kernel = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_polly = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_smbios = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_utils = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+msb_krun_vmm = { git = "https://github.com/TijsVK/libkrun", branch = "task/t887-fuzz-targets" }
+russh = { git = "https://github.com/TijsVK/russh", tag = "v0.64.1-puddle.1" }
+msb-imago = { git = "https://github.com/TijsVK/imago", tag = "v0.1.7-puddle.1" }
+
+[[bin]]
+name = "fuse_passthrough"
+path = "fuzz_targets/fuse_passthrough.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuse_memfs"
+path = "fuzz_targets/fuse_memfs.rs"
+test = false
+doc = false
+bench = false
