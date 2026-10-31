@@ -12,7 +12,7 @@
 # Cases:
 #   running:  while the sandbox runs, exactly one folder exists, and some process holds it open
 #   stopped:  after `msb stop` no folder is left (red when the runtime's exit hook is removed)
-#   failed:   a start that fails after the folder was made (the root disk image is gone) leaves none
+#   failed:   a start that fails after the folder was made (the root disk image is a directory) leaves none
 #   killed:   SIGKILL of the runner leaves its folder (the case would otherwise prove nothing)
 #   swept:    once the folder is older than the sweep's minimum age, the next start removes it, and
 #             the new sandbox's own folder is untouched
@@ -72,13 +72,15 @@ wait_count 20 0; n=$(count)
 ok=0; [ "$n" = 0 ] && ok=1
 case_result stopped "$ok" "folders left after stop: $n $(folders | tr '\n' ' ')"
 
-# failed: the root disk image of the stopped sandbox is gone, so the start fails after the
-# folder was made.
+# failed: the root disk image of the stopped sandbox is a directory, so the start fails when the VMM
+# opens it, after the folder was made.
 img=$MSB_HOME/sandboxes/$name/upper.ext4
 [ -f "$img" ] || { echo "setup: no root disk image at $img"; exit 2; }
 mv "$img" "$img.away"
+mkdir "$img"
 "$msb" start "$name" >"$work/start-fail.log" 2>&1; start_rc=$?
 wait_count 20 0; n=$(count)
+rmdir "$img"
 mv "$img.away" "$img"
 ok=0; [ "$start_rc" -ne 0 ] && [ "$n" = 0 ] && ok=1
 echo "failed start: rc=$start_rc: $(tail -3 "$work/start-fail.log" | tr '\n' ' ')"
