@@ -98,7 +98,8 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$REV" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::libkrun_rev must be a commit sha"; exit 1; }
-          sed -i "s|git = \"https://github.com/TijsVK/libkrun\", \(branch\|tag\) = \"[^\"]*\"|git = \"https://github.com/TijsVK/libkrun\", rev = \"$REV\"|" Cargo.toml
+          # '#' as the delimiter: with '|' the alternation's \| is read as a literal '|' and nothing matches.
+          sed -i "s#git = \"https://github.com/TijsVK/libkrun\", \(branch\|tag\) = \"[^\"]*\"#git = \"https://github.com/TijsVK/libkrun\", rev = \"$REV\"#" Cargo.toml
           grep -c "rev = \"$REV\"" Cargo.toml
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
