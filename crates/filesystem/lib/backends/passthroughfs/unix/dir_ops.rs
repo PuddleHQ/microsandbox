@@ -32,6 +32,7 @@ pub(crate) fn do_opendir(
     inode: u64,
     flags: u32,
 ) -> io::Result<(Option<u64>, OpenOptions)> {
+    fs.ensure_handle_room()?;
     let fd = inode::open_inode_fd(fs, inode, libc::O_RDONLY | libc::O_DIRECTORY)?;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
 

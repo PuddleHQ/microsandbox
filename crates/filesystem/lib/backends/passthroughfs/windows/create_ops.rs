@@ -17,6 +17,7 @@ impl PassthroughFs {
         umask: u32,
     ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
         self.require_writable()?;
+        self.ensure_handle_room()?;
         let path = self.child_path(parent, name)?;
         let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
         let parent_metadata = self.safe_metadata(parent_path)?;

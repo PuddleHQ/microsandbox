@@ -403,6 +403,11 @@ pub(crate) fn eexist() -> io::Error {
     io::Error::from_raw_os_error(LINUX_EEXIST)
 }
 
+/// Create an `io::Error` with Linux `EMFILE`.
+pub(crate) fn emfile() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_EMFILE)
+}
+
 /// Create an `io::Error` with Linux `ENOSPC`.
 pub(crate) fn enospc() -> io::Error {
     io::Error::from_raw_os_error(LINUX_ENOSPC)

@@ -50,6 +50,7 @@ pub struct PassthroughFsBuilder {
     bind_identity_map: Option<BindIdentityMapHandle>,
     quota_bytes: Option<u64>,
     max_state_bytes: usize,
+    max_open_handles: usize,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -72,6 +73,7 @@ impl PassthroughFsBuilder {
             inject_init: true,
             bind_identity_map: None,
             quota_bytes: None,
+            max_open_handles: super::DEFAULT_MAX_OPEN_HANDLES,
             max_state_bytes: msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
         }
     }
@@ -153,6 +155,12 @@ impl PassthroughFsBuilder {
         self
     }
 
+    /// Set the most handles the guest may hold open on this mount at once (`EMFILE` past it).
+    pub fn max_open_handles(mut self, limit: usize) -> Self {
+        self.max_open_handles = limit;
+        self
+    }
+
     /// Set the largest serialized filesystem state, in bytes, this mount captures or restores.
     pub fn with_state_limit(mut self, bytes: usize) -> Self {
         self.max_state_bytes = bytes;
@@ -190,6 +198,7 @@ impl PassthroughFsBuilder {
             bind_identity_map: self.bind_identity_map,
             quota_bytes: self.quota_bytes,
             quota_root: None,
+            max_open_handles: self.max_open_handles,
         };
 
         // Open the root directory, contained beneath the anchor when one is set.

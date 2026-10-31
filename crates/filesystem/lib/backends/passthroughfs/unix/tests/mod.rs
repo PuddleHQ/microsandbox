@@ -8,6 +8,7 @@ mod test_dax;
 mod test_dir_ops;
 mod test_file_ops;
 mod test_flag_translation;
+mod test_handle_cap;
 mod test_host_permissions;
 mod test_init_binary;
 mod test_kill_priv;

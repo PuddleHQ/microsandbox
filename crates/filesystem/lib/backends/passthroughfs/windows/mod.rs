@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::agentd::agentd_bytes;
+use super::DEFAULT_MAX_OPEN_HANDLES;
 use crate::{
     AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
     GetxattrReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
@@ -90,6 +91,7 @@ const LINUX_EXDEV: i32 = 18;
 const LINUX_ENOTDIR: i32 = 20;
 const LINUX_EISDIR: i32 = 21;
 const LINUX_EINVAL: i32 = 22;
+const LINUX_EMFILE: i32 = 24;
 #[cfg(test)]
 const LINUX_ENOSPC: i32 = 28;
 const LINUX_EROFS: i32 = 30;

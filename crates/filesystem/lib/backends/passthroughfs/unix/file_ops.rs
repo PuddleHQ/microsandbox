@@ -54,6 +54,7 @@ pub(crate) fn do_open(
     if fs.cfg.readonly() && open_flags_mutate(open_flags) {
         return Err(platform::erofs());
     }
+    fs.ensure_handle_room()?;
 
     // Snapshot the quota baseline before any write-intent open (which may carry
     // O_TRUNC). This precedes the file's first write, so the baseline reflects
