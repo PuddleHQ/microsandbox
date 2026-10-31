@@ -151,6 +151,38 @@ mod tests {
 
     use super::*;
 
+    /// A guest that opens stream connections in a loop (peers that never read) holds at most
+    /// 128 descriptors' worth on a default route; the 129th is refused.
+    #[test]
+    fn a_connection_flood_on_a_default_route_stops_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let service = UnixStreamPortBackend::new(&path).unwrap();
+        let request = || VsockConnectRequest {
+            guest_cid: 3,
+            guest_port: 4000,
+            host_port: 5000,
+        };
+        let mut held = Vec::new();
+        for _ in 0..128 {
+            held.push(
+                service
+                    .connect(request(), VsockNotifier::new().unwrap())
+                    .unwrap(),
+            );
+        }
+        let refused = service
+            .connect(request(), VsockNotifier::new().unwrap())
+            .err()
+            .expect("the 129th connection must be refused");
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        drop(held);
+        service
+            .connect(request(), VsockNotifier::new().unwrap())
+            .unwrap();
+    }
+
     #[test]
     fn stream_backend_connects_and_moves_bytes_in_both_directions() {
         let dir = tempfile::tempdir().unwrap();
