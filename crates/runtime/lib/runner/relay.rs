@@ -11761,4 +11761,86 @@ mod tests {
         .await
         .unwrap();
     }
+
+    fn accepted_tcp_merger(id: u32, budget: &Arc<Semaphore>) -> GuestFrameMerger {
+        let mut merger = GuestFrameMerger::default();
+        merger.register(TEST_INCARNATION, id).unwrap();
+        merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::BulkAccepted,
+                    id,
+                    &BulkAccepted {
+                        kind: BulkKind::Tcp,
+                        ..bulk_accepted()
+                    },
+                ),
+                budget,
+            ))
+            .unwrap();
+        merger
+    }
+
+    fn tcp_reset_terminal(id: u32, budget: &Arc<Semaphore>) -> LaneFrame {
+        lane_frame(
+            encoded_message_id(
+                MessageType::TcpFailed,
+                id,
+                &TcpFailed {
+                    error: "read TCP stream: Connection reset by peer (os error 104)".into(),
+                },
+            ),
+            budget,
+        )
+    }
+
+    /// agentd sends a finish ahead of a read failure, so the failure waits for the trailing record.
+    #[test]
+    fn guest_merger_delivers_records_ahead_of_a_failure_behind_its_finish() {
+        let id = 83;
+        let budget = Arc::new(Semaphore::new(64 * 1024));
+        let full = budget.available_permits();
+        let mut merger = accepted_tcp_merger(id, &budget);
+        assert_eq!(
+            merger
+                .push(lane_frame(encoded_raw(id, 0, b"abc"), &budget))
+                .unwrap()
+                .len(),
+            1
+        );
+        let finish = BulkFinish {
+            kind: BulkKind::Tcp,
+            flow: BulkFlow::GuestToHost,
+            final_offset: 6,
+        };
+        assert!(
+            merger
+                .push(lane_frame(
+                    encoded_message_id(MessageType::BulkFinish, id, &finish),
+                    &budget,
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            merger
+                .push(tcp_reset_terminal(id, &budget))
+                .unwrap()
+                .is_empty()
+        );
+        let ready = merger
+            .push(lane_frame(encoded_raw(id, 3, b"def"), &budget))
+            .unwrap();
+        let types: Vec<_> = ready
+            .iter()
+            .skip(1)
+            .map(|frame| decode_frame(frame.frame.data.as_ref()).unwrap().t)
+            .collect();
+        assert_eq!(ready.len(), 3);
+        assert_eq!(raw_bulk_offsets(&ready[0].frame).unwrap().0, 3);
+        assert_eq!(types, [MessageType::BulkFinish, MessageType::TcpFailed]);
+        drop(ready);
+        assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
+        assert_eq!(budget.available_permits(), full);
+    }
 }
