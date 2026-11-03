@@ -8,7 +8,10 @@
 use std::{path::Path, time::Duration};
 
 use sea_orm::{DatabaseConnection, SqlxSqliteConnector};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{
+    Connection,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+};
 
 use crate::connection::{DbReadConnection, DbWriteConnection};
 
@@ -82,6 +85,9 @@ pub(crate) async fn build_pool(
     busy_timeout: Duration,
     create_if_missing: bool,
 ) -> Result<DatabaseConnection, sqlx::Error> {
+    // Held until the pool has connected: see `open_ahead`.
+    let ahead = open_ahead(db_path, busy_timeout, create_if_missing).await?;
+
     let connect_options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(create_if_missing)
@@ -97,8 +103,72 @@ pub(crate) async fn build_pool(
             .connect_with(connect_options.clone())
     })
     .await?;
+    if let Err(error) = ahead.close().await {
+        tracing::debug!(%error, "closing the connection opened ahead of the pool failed");
+    }
 
     Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
+}
+
+/// How long the first connection to a catalog may take before it is given up.
+///
+/// A bound for a stuck disk only. It is not a wait for a pool slot, so the caller's connect
+/// timeout does not apply to it.
+const OPEN_AHEAD_LIMIT: Duration = Duration::from_secs(600);
+
+/// Opens one connection to the catalog before the pool does, outside the pool's connect timeout,
+/// and returns it to be held until the pool has connected.
+///
+/// The first connection to a catalog is where the disk is touched: a new file is created and
+/// switched to WAL mode, or the `-wal` and `-shm` files that the last closer removed are created
+/// again. Each of these makes the file system commit its journal, which on a host whose disk is
+/// busy with other writers can take tens of seconds (49 s measured with eight writers on the Linux
+/// host), far over the pool's connect timeout. The open then failed with `pool timed out while
+/// waiting for an open connection` although nothing was contended. This connection absorbs that
+/// wait under its own limit; while it is held the pool finds the files in place and its connect
+/// takes milliseconds, so the connect timeout again bounds only what its name says.
+///
+/// `sqlx` applies `journal_mode` before `synchronous`, so inside the pool the one-time switch to
+/// WAL also ran with the default full sync; here the file is synchronised normally. WAL mode is
+/// persistent in the file, so the switch happens only for a file that is not in it yet. The mode
+/// is read through the connection: opening and closing the file by any other means in this
+/// process would drop the locks SQLite holds on it.
+async fn open_ahead(
+    db_path: &Path,
+    busy_timeout: Duration,
+    create_if_missing: bool,
+) -> Result<sqlx::SqliteConnection, sqlx::Error> {
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(create_if_missing)
+        .busy_timeout(busy_timeout)
+        .synchronous(SqliteSynchronous::Normal);
+    let open = retry_transient_io(CONNECT_RETRY_DELAYS, || async {
+        let mut conn = sqlx::SqliteConnection::connect_with(&options).await?;
+        if create_if_missing {
+            let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut conn)
+                .await?;
+            if !mode.eq_ignore_ascii_case("wal") {
+                sqlx::query("PRAGMA journal_mode = WAL")
+                    .execute(&mut conn)
+                    .await?;
+            }
+        }
+        Ok(conn)
+    });
+    tokio::time::timeout(OPEN_AHEAD_LIMIT, open)
+        .await
+        .map_err(|_| {
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "opening {} took over {} s",
+                    db_path.display(),
+                    OPEN_AHEAD_LIMIT.as_secs()
+                ),
+            ))
+        })?
 }
 
 /// Waits between attempts to connect when SQLite reports a transient I/O error, about 6.4 s in all.
