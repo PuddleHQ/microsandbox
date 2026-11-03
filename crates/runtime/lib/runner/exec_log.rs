@@ -139,6 +139,9 @@ impl LogWriter {
                     error = %err,
                     "exec_log: cannot rotate exec.log; it keeps growing and the rotation is retried"
                 ),
+                Some(crate::logging::RotationEvent::Dropping) => tracing::warn!(
+                    "exec_log: exec.log reached its ceiling while it cannot rotate; entries are dropped until the rotation works"
+                ),
                 Some(crate::logging::RotationEvent::Recovered) => {
                     tracing::info!("exec_log: exec.log rotates again after an earlier failure");
                 }
