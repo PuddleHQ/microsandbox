@@ -85,6 +85,9 @@ const EXIT_REASON_STARTUP_COMMAND_FAILED: u8 = 7;
 /// Bounds how long an existing VMM can retain an obsolete fair share after membership changes.
 const WRITEBACK_PRESSURE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long the VM exit observer waits for the catalog pool to close before it lets the process go.
+const CATALOG_CLOSE_LIMIT: Duration = Duration::from_secs(2);
+
 /// Virtqueue size retained when the primary agent port carries control traffic only.
 const AGENT_CONTROL_QUEUE_SIZE: u16 = 32;
 
@@ -1084,6 +1087,13 @@ fn run(
                         tracing::warn!(error = %err, "ephemeral exit self-clean failed")
                     }
                 }
+
+                // The VMM leaves through `_exit()`, which never drops the pool. Close it here so
+                // SQLite checkpoints and, as the last user, removes `-wal` and `-shm`; otherwise
+                // the next process to open the catalog has to recover it (on Windows that
+                // recovery can fail with `SQLITE_IOERR_TRUNCATE` while this process still tears
+                // down).
+                exit_db.close(CATALOG_CLOSE_LIMIT).await;
             });
 
             // Inject the exec.log lifecycle-stop marker before _exit().
