@@ -98,21 +98,82 @@ pub(crate) async fn build_pool(
 
     // Concurrent first opens can return BUSY while enabling WAL, even with SQLite's
     // busy timeout. Retry the entire connection setup within the caller's deadline.
-    let pool = tokio::time::timeout(
-        connect_timeout,
-        crate::retry::retry_on_busy(|| {
-            SqlitePoolOptions::new()
-                .max_connections(max_connections)
-                .acquire_timeout(connect_timeout)
-                .connect_with(connect_options.clone())
-        }),
-    )
-    .await
-    .map_err(|_| sqlx::Error::PoolTimedOut)??;
+    // A transient I/O error is retried around that, each attempt with a deadline of its own:
+    // see `CONNECT_RETRY_DELAYS`.
+    let pool = retry_transient_io(CONNECT_RETRY_DELAYS, || async {
+        tokio::time::timeout(
+            connect_timeout,
+            crate::retry::retry_on_busy(|| {
+                SqlitePoolOptions::new()
+                    .max_connections(max_connections)
+                    .acquire_timeout(connect_timeout)
+                    .connect_with(connect_options.clone())
+            }),
+        )
+        .await
+        .map_err(|_| sqlx::Error::PoolTimedOut)?
+    })
+    .await?;
 
     harden_database_files(&db_path).map_err(sqlx::Error::Io)?;
 
     Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
+}
+
+/// Waits between attempts to connect when SQLite reports a transient I/O error, about 6.4 s in all.
+///
+/// Opening the catalog while another msb process that used it is exiting can fail with
+/// `SQLITE_IOERR_TRUNCATE` ("disk I/O error", code 1546) on Windows. SQLite's busy handler does
+/// not cover I/O errors, and the next attempt a moment later succeeds: puddle's Windows runs saw
+/// one such failure per run and a single retry 500 ms later always resolved it. Most clear within
+/// 0.25 s; the tail (1.6 s and 3.2 s) covers the rare longer event, such as one after a hard kill of
+/// the runtime, and costs nothing unless an attempt fails.
+pub(crate) const CONNECT_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+    Duration::from_millis(1600),
+    Duration::from_millis(3200),
+];
+
+/// SQLite's primary result code for I/O errors; extended codes carry it in their low byte.
+const SQLITE_IOERR: i32 = 10;
+
+/// Whether `err` is an I/O error reported by SQLite (`SQLITE_IOERR` or an extended code of it).
+pub(crate) fn is_sqlite_io_error(err: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db_err) = err else {
+        return false;
+    };
+    db_err
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code & 0xff == SQLITE_IOERR)
+}
+
+/// Runs `connect`, trying again after each of `delays` while it fails with a SQLite I/O error.
+/// Every other error, and the last I/O error once the delays are used up, is returned as is.
+pub(crate) async fn retry_transient_io<F, Fut, T>(
+    delays: &[Duration],
+    mut connect: F,
+) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut attempt = 0;
+    loop {
+        match connect().await {
+            Err(err) if is_sqlite_io_error(&err) && attempt < delays.len() => {
+                tracing::warn!(error = %err, attempt = attempt + 1, "SQLite I/O error while connecting, retrying");
+                tokio::time::sleep(delays[attempt]).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -121,10 +182,109 @@ pub(crate) async fn build_pool(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        borrow::Cow,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    use sqlx::{ConnectOptions, Executor};
+    use sqlx::{
+        ConnectOptions, Executor,
+        error::{DatabaseError, ErrorKind},
+    };
 
     use super::*;
+
+    /// A driver error with a chosen SQLite result code.
+    #[derive(Debug)]
+    struct CodedError(&'static str);
+
+    impl std::fmt::Display for CodedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "(code: {}) test error", self.0)
+        }
+    }
+
+    impl std::error::Error for CodedError {}
+
+    impl DatabaseError for CodedError {
+        fn message(&self) -> &str {
+            "test error"
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+    }
+
+    fn coded(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(CodedError(code)))
+    }
+
+    const FAST: &[Duration] = &[Duration::from_millis(1); 3];
+
+    #[test]
+    fn io_errors_are_recognised_by_primary_and_extended_code() {
+        // IOERR, IOERR_READ, IOERR_FSYNC, IOERR_TRUNCATE (what Windows reported), IOERR_SHMMAP.
+        for code in ["10", "266", "1034", "1546", "5130"] {
+            assert!(is_sqlite_io_error(&coded(code)), "{code}");
+        }
+        // ERROR, BUSY, BUSY_SNAPSHOT, CANTOPEN, a code that is not a number.
+        for code in ["1", "5", "517", "14", "x"] {
+            assert!(!is_sqlite_io_error(&coded(code)), "{code}");
+        }
+        assert!(!is_sqlite_io_error(&sqlx::Error::PoolTimedOut));
+    }
+
+    #[tokio::test]
+    async fn a_transient_io_error_is_retried_until_it_clears() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_transient_io(FAST, || async {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(coded("1546"))
+            } else {
+                Ok("connected")
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), "connected");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_io_error_gives_up_after_the_last_delay() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), _> = retry_transient_io(FAST, || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(coded("1546"))
+        })
+        .await;
+        assert!(is_sqlite_io_error(&result.unwrap_err()));
+        assert_eq!(attempts.load(Ordering::SeqCst), FAST.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn other_errors_are_not_retried() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), _> = retry_transient_io(FAST, || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(coded("1"))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn catalog_open_retries_busy_setup_within_connect_timeout() {
