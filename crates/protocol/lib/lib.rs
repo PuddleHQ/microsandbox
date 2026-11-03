@@ -93,6 +93,11 @@ pub const RUNTIME_FS_TAG: &str = "msb_runtime";
 /// a user-facing knob.
 pub const RUNTIME_FS_QUOTA_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Guest-write byte budget for the bootstrap root (`/dev/root` before agentd pivots to the real
+/// root). The guest only creates a few mountpoints there, so this is abuse headroom, and like
+/// [`RUNTIME_FS_QUOTA_BYTES`] it is a fixed constant.
+pub const BOOTSTRAP_FS_QUOTA_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Default per-device virtio-fs state budget, in MiB.
 pub const FS_STATE_LIMIT_DEFAULT_MIB: u32 = 4;
 
