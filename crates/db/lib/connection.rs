@@ -89,11 +89,13 @@ impl DbReadConnection {
             .read_only(true)
             .create_if_missing(false)
             .busy_timeout(busy_timeout);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(connect_timeout)
-            .connect_with(options)
-            .await?;
+        let pool = pool::retry_transient_io(pool::CONNECT_RETRY_DELAYS, || {
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(connect_timeout)
+                .connect_with(options.clone())
+        })
+        .await?;
         Ok(Self(sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(
             pool,
         )))
@@ -127,6 +129,20 @@ impl DbWriteConnection {
     /// Borrow the underlying sea-orm connection.
     pub fn inner(&self) -> &DatabaseConnection {
         &self.0
+    }
+
+    /// Close the pool, waiting at most `limit` for statements still in flight.
+    ///
+    /// For a process that ends without dropping its pool (the sandbox runtime leaves through
+    /// `_exit`): the last connection to close checkpoints the WAL and removes `-wal` and `-shm`,
+    /// so the next opener finds a clean catalog instead of recovering one. Best effort: a pool
+    /// that does not close in time is logged and left to the operating system.
+    pub async fn close(&self, limit: Duration) {
+        match tokio::time::timeout(limit, self.0.close_by_ref()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "closing the catalog pool failed"),
+            Err(_) => tracing::warn!(?limit, "closing the catalog pool timed out"),
+        }
     }
 
     /// Run a multi-statement atomic write inside a transaction with
@@ -244,6 +260,43 @@ mod tests {
     use super::*;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn closing_the_last_connection_removes_the_wal_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let writer = DbWriteConnection::open(&path, TIMEOUT, TIMEOUT)
+            .await
+            .unwrap();
+        writer
+            .execute_unprepared("CREATE TABLE close_test (value INTEGER)")
+            .await
+            .unwrap();
+        let wal = dir.path().join("catalog.db-wal");
+        let shm = dir.path().join("catalog.db-shm");
+        assert!(wal.exists() && shm.exists(), "WAL files exist while open");
+
+        writer.close(TIMEOUT).await;
+
+        assert!(!wal.exists(), "-wal removed by the last close");
+        assert!(!shm.exists(), "-shm removed by the last close");
+    }
+
+    #[tokio::test]
+    async fn close_gives_up_after_its_limit_when_a_connection_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let writer = DbWriteConnection::open(&path, TIMEOUT, TIMEOUT)
+            .await
+            .unwrap();
+        // An open transaction holds the pool's only connection.
+        let _txn = writer.inner().begin().await.unwrap();
+
+        let started = std::time::Instant::now();
+        writer.close(Duration::from_millis(100)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[tokio::test]
     async fn strict_reader_sees_wal_commits_but_cannot_write() {
