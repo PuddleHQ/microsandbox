@@ -49,9 +49,11 @@ use() { # runtime dir: run the following commands with that release's msb
 # shellcheck disable=SC2329 # called by the EXIT trap
 cleanup() {
   use "$rt"
-  for sandbox in "$name" "$victim" "$name-plain" "$name-armed" "$name-avictim"; do
-    "$msb" stop "$sandbox" >/dev/null 2>&1
-    "$msb" rm -f "$sandbox" >/dev/null 2>&1
+  for home in "$work/home" "$work/home-up"; do
+    for sandbox in "$name" "$victim" "$name-plain" "$name-armed" "$name-avictim"; do
+      MSB_HOME=$home "$msb" stop "$sandbox" >/dev/null 2>&1
+      MSB_HOME=$home "$msb" rm -f "$sandbox" >/dev/null 2>&1
+    done
   done
 }
 trap cleanup EXIT
@@ -127,7 +129,9 @@ if [ -z "$old_rt" ]; then
   exit "$fail"
 fi
 
-# Sandboxes made by the old release, started by this one.
+# Sandboxes made by the old release, started by this one. A separate home: the catalog this release
+# opened is newer than the old one understands.
+export MSB_HOME=$work/home-up
 use "$old_rt"
 plain=$name-plain
 armed=$name-armed
