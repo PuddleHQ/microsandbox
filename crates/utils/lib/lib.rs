@@ -83,8 +83,23 @@ pub const MSB_BINARY: &str = "msb";
 /// Version for downloading prebuilt release artifacts.
 ///
 /// This tracks the published crate/package version so the SDK and the
-/// downloaded runtime bundle stay aligned.
-pub const PREBUILT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// downloaded runtime bundle stay aligned. A pre-release suffix (the puddle
+/// fork's `-puddle.N`) is dropped: the fork has no release assets of its own
+/// and uses the upstream release's agentd and runtime bundle.
+pub const PREBUILT_VERSION: &str = release_version(env!("CARGO_PKG_VERSION"));
+
+/// `0.7.7-puddle.2` -> `0.7.7`; a version without a suffix is returned as is.
+const fn release_version(version: &str) -> &str {
+    let bytes = version.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() && bytes[end] != b'-' && bytes[end] != b'+' {
+        end += 1;
+    }
+    match std::str::from_utf8(bytes.split_at(end).0) {
+        Ok(release) => release,
+        Err(_) => panic!("CARGO_PKG_VERSION is not UTF-8"),
+    }
+}
 
 /// libkrunfw release version. Keep in sync with justfile.
 pub const LIBKRUNFW_VERSION: &str = "5.6.1";
