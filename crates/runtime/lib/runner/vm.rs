@@ -3124,6 +3124,7 @@ fn bootstrap_trampoline_backend(
         max_state_bytes: limit,
         root_dir: canonicalize_owned_mount_root(trampoline.path())?,
         no_symlink_root: true,
+        quota_bytes: Some(microsandbox_protocol::BOOTSTRAP_FS_QUOTA_BYTES),
         ..Default::default()
     };
     let backend = PassthroughFs::new(cfg)
@@ -3747,6 +3748,10 @@ fn rotation_notice(log_prefix: &str, event: &crate::logging::RotationEvent) -> S
         RotationEvent::Failed(err) => format!(
             "puddle: cannot rotate the {log_prefix} log ({err}); \
              the log keeps growing past its limit and the rotation is retried"
+        ),
+        RotationEvent::Dropping => format!(
+            "puddle: the {log_prefix} log reached its ceiling while it cannot rotate; \
+             output is dropped until the rotation works again"
         ),
         RotationEvent::Recovered => {
             format!("puddle: the {log_prefix} log rotates again after an earlier failure")
@@ -4499,6 +4504,94 @@ mod tests {
         // `bootstrap_trampoline_backend` `keep()`s its TempDir, so hand the
         // bootstrap rootfs back through the production reclamation path
         // instead of leaving it in the host temp tree on every test run.
+        remove_trampoline_rootfs_dirs(std::slice::from_ref(&rootfs_dir));
+        assert!(!rootfs_dir.exists());
+    }
+
+    /// Feeds `len` zero bytes to a write handler, the way the virtio-fs server hands it guest data.
+    #[cfg(unix)]
+    struct ZeroReader {
+        left: usize,
+    }
+
+    #[cfg(unix)]
+    impl microsandbox_filesystem::ZeroCopyReader for ZeroReader {
+        fn read_to(&mut self, f: &std::fs::File, count: usize, off: u64) -> std::io::Result<usize> {
+            use std::os::fd::AsRawFd;
+
+            let n = count.min(self.left);
+            let zeros = vec![0u8; n];
+            // SAFETY: `zeros` is valid for `n` bytes and `f` is an open descriptor.
+            let written =
+                unsafe { libc::pwrite(f.as_raw_fd(), zeros.as_ptr().cast(), n, off as i64) };
+            if written < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            self.left -= written as usize;
+            Ok(written as usize)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_root_refuses_a_flood_past_its_quota() {
+        use microsandbox_filesystem::Extensions;
+
+        const ENOSPC: i32 = 28;
+        let sandbox_dir = tempfile::tempdir().unwrap();
+        let (fs, rootfs_dir) = bootstrap_trampoline_backend(
+            msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
+            sandbox_dir.path(),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        // The guest creates a file and writes far past the budget, in 1 MiB writes.
+        let name = std::ffi::CString::new("flood").unwrap();
+        let (entry, handle, _) = fs
+            .create(
+                fs_context(),
+                1,
+                &name,
+                0o644,
+                false,
+                2,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        let budget = microsandbox_protocol::BOOTSTRAP_FS_QUOTA_BYTES;
+        let mut offset = 0u64;
+        let mut refused = None;
+        for _ in 0..(budget / (1 << 20) * 4) {
+            let mut reader = ZeroReader { left: 1 << 20 };
+            match fs.write(
+                fs_context(),
+                entry.inode,
+                handle,
+                &mut reader,
+                1 << 20,
+                offset,
+                None,
+                false,
+                false,
+                0,
+            ) {
+                Ok(n) => offset += n as u64,
+                Err(error) => {
+                    refused = error.raw_os_error();
+                    break;
+                }
+            }
+        }
+        assert_eq!(refused, Some(ENOSPC), "the flood must be refused");
+        let on_disk = std::fs::metadata(rootfs_dir.join("flood")).unwrap().len();
+        assert!(
+            on_disk <= budget,
+            "the file grew to {on_disk}, past {budget}"
+        );
+
         remove_trampoline_rootfs_dirs(std::slice::from_ref(&rootfs_dir));
         assert!(!rootfs_dir.exists());
     }

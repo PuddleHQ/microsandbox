@@ -19,6 +19,11 @@ const MAX_ROTATED_FILES: u32 = 3;
 /// Default wait before a failed rotation is tried again.
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// A log whose rotation keeps failing stops taking writes at this many times `max_bytes`. The
+/// writer keeps data while a rotation is unfinished (see [`RotatingLog`]), but the guest decides
+/// what gets logged, so without a ceiling a guest could fill the host disk behind a blocked rename.
+const UNROTATABLE_LIMIT_FACTOR: u64 = 8;
+
 /// Suffix of the file that holds a full log while its rotation is unfinished.
 const PENDING_SUFFIX: &str = "rotating";
 
@@ -32,7 +37,8 @@ const PENDING_SUFFIX: &str = "rotating";
 /// Rotated files are renamed with a numeric suffix (e.g., `vm.log.1`).
 ///
 /// A failed rotation step never drops data and never costs an older log:
-/// the writer keeps appending to the current file, remembers that the
+/// the writer keeps appending to the current file (up to eight times the limit, then it drops
+/// writes until the rotation works), remembers that the
 /// rotation is unfinished, retries it after [`DEFAULT_RETRY_INTERVAL`], and
 /// queues one [`RotationEvent`] per failure episode for the caller to report
 /// ([`RotatingLog::take_rotation_event`]). On Windows a rotation fails when
@@ -71,6 +77,9 @@ pub struct RotatingLog {
     /// A failure episode is going on (reported, not yet recovered).
     failing: bool,
 
+    /// The log is past its ceiling during a failure episode and drops writes.
+    dropping: bool,
+
     /// Event for the caller, not taken yet.
     event: Option<RotationEvent>,
 }
@@ -78,9 +87,13 @@ pub struct RotatingLog {
 /// What the caller should report about rotation, once per change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RotationEvent {
-    /// A rotation step failed. The log keeps growing past its limit and the
-    /// rotation is retried.
+    /// A rotation step failed. The log keeps growing past its limit (up to a ceiling, see
+    /// [`RotationEvent::Dropping`]) and the rotation is retried.
     Failed(String),
+
+    /// The log passed its ceiling (a multiple of its limit) while the rotation keeps failing.
+    /// Writes are dropped until a rotation succeeds.
+    Dropping,
 
     /// A rotation finished after an earlier failure.
     Recovered,
@@ -110,6 +123,7 @@ impl RotatingLog {
             next_retry: Instant::now(),
             retry_interval: DEFAULT_RETRY_INTERVAL,
             failing: false,
+            dropping: false,
             event: None,
         };
         // A full log left aside by a process that died mid-rotation.
@@ -132,6 +146,7 @@ impl RotatingLog {
             match self.rotate(full) {
                 Ok(()) => {
                     self.unfinished = false;
+                    self.dropping = false;
                     if self.failing {
                         self.failing = false;
                         self.event = Some(RotationEvent::Recovered);
@@ -146,6 +161,17 @@ impl RotatingLog {
                     }
                 }
             }
+        }
+
+        if self.unfinished
+            && self.written.saturating_add(data.len() as u64)
+                > self.max_bytes.saturating_mul(UNROTATABLE_LIMIT_FACTOR)
+        {
+            if !self.dropping {
+                self.dropping = true;
+                self.event = Some(RotationEvent::Dropping);
+            }
+            return Ok(());
         }
 
         self.file.write_all(data)?;
@@ -399,6 +425,40 @@ mod tests {
         );
         assert_eq!(read(dir.path(), "t.log.2"), [b'b'; 8]);
         assert_eq!(read(dir.path(), "t.log.3"), [b'a'; 8]);
+    }
+
+    #[test]
+    fn test_blocked_rotation_stops_growing_at_the_ceiling_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RotatingLog::new(dir.path(), "t", 100).unwrap();
+        log.set_retry_interval(Duration::from_millis(20));
+        log.write(&[b'a'; 60]).unwrap();
+        let Some(blocker) = RotationBlocker::new(&dir.path().join("t.log")) else {
+            eprintln!("cannot block renames here (root?); skipped");
+            return;
+        };
+        // A flood of 100 times the limit while every rename fails.
+        for _ in 0..1000 {
+            log.write(&[b'f'; 10]).unwrap();
+        }
+        let size = read(dir.path(), "t.log").len() as u64;
+        assert!(size <= 100 * UNROTATABLE_LIMIT_FACTOR, "grew to {size}");
+        assert!(
+            size >= 100 * UNROTATABLE_LIMIT_FACTOR - 10,
+            "stopped early at {size}"
+        );
+        assert!(matches!(
+            log.take_rotation_event(),
+            Some(RotationEvent::Dropping)
+        ));
+        assert_eq!(log.take_rotation_event(), None, "reported once");
+
+        // Once renames work again the next write rotates and logging resumes.
+        drop(blocker);
+        std::thread::sleep(Duration::from_millis(25));
+        log.write(&[b'z'; 8]).unwrap();
+        assert_eq!(log.take_rotation_event(), Some(RotationEvent::Recovered));
+        assert_eq!(read(dir.path(), "t.log"), [b'z'; 8]);
     }
 
     #[test]
