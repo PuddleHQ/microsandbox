@@ -706,6 +706,14 @@ jobs:
     with:
       ref: ${{ needs.prepare.outputs.tag }}
 
+  root-journal:
+    name: Root-disk journal
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true' && !inputs.candidate
+    uses: ./.github/workflows/puddle-root-journal.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
   # A workspace volume made by the previous fork release opens, reads and writes on this build.
   volume-compat:
     name: Volume from the previous release
@@ -764,7 +772,7 @@ jobs:
 
   release:
     name: Publish release
-    needs: [prepare, build-agentd, build-windows, build-linux, test-windows, test-linux, repros, volume-compat, launcher-isolation, vsock-tail, forward-cap-linux, linux-discard]
+    needs: [prepare, build-agentd, build-windows, build-linux, test-windows, test-linux, repros, volume-compat, launcher-isolation, vsock-tail, forward-cap-linux, linux-discard, root-journal]
     if: >-
       !cancelled() && !inputs.candidate && (github.ref_type == 'tag' || inputs.publish) &&
       needs.prepare.result == 'success' && needs.build-agentd.result == 'success' &&
@@ -772,7 +780,8 @@ jobs:
       needs.test-windows.result == 'success' && needs.test-linux.result == 'success' &&
       needs.repros.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.volume-compat.result) &&
       needs.launcher-isolation.result == 'success' && needs.vsock-tail.result == 'success' &&
-      needs.forward-cap-linux.result == 'success' && needs.linux-discard.result == 'success'
+      needs.forward-cap-linux.result == 'success' && needs.linux-discard.result == 'success' &&
+      needs.root-journal.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
