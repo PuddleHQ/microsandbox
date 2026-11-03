@@ -7,7 +7,7 @@
 # boot-stress-<shard>, and prints a "boot-evidence" line that tells the T-096 timer-check panic
 # (rtc-c-polls=90, empty kernel.log) from other early exits.
 #
-#   gh workflow run puddle-boot-stress.yml -R TijsVK/microsandbox -f release_tag=v0.7.7-puddle.7 \
+#   gh workflow run puddle-boot-stress.yml -R PuddleHQ/microsandbox -f release_tag=v0.7.7-puddle.7 \
 #     -f shards='[1,2,3,4,5,6,7,8,9,10]' -f rounds=25 -f par=8 -f cpus=2 -f memory=1024
 name: puddle boot stress
 
@@ -17,7 +17,7 @@ on:
       release_repo:
         description: "Repo whose release to test"
         required: true
-        default: TijsVK/microsandbox
+        default: PuddleHQ/microsandbox
         type: string
       release_tag:
         description: "Release tag, e.g. v0.7.7-puddle.7"

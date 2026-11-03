@@ -5,7 +5,7 @@
 # usage: use-candidate.sh <dir with candidate.json and bundles>
 # Run in the repo root, checked out at the upstream release the candidate was replayed on. Fetches
 # msb.bundle and checks out the new stack tip. For a libkrun/russh leg that was replayed too, it
-# builds a local mirror holding the new branch and points `https://github.com/TijsVK/<repo>` at it
+# builds a local mirror holding the new branch and points `https://github.com/PuddleHQ/<repo>` at it
 # (git url.insteadOf, cargo through the git CLI), so `cargo build --locked` gets exactly the commits
 # the new Cargo.lock pins although nothing was pushed. Works in Git Bash on Windows too.
 set -euo pipefail

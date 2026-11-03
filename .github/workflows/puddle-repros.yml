@@ -8,7 +8,7 @@
 # * workflow_call from puddle-release.yml: tests the msb.exe that run just built (artifact
 #   `msb-windows-x86_64`) with upstream's libkrunfw (artifact `upstream-assets`); gates publishing.
 # * workflow_dispatch: tests a published release's msb-windows-x86_64.exe + libkrunfw dll, e.g.
-#   repo TijsVK/microsandbox tag v0.7.7-puddle.2 (green), or superradcompany/microsandbox tag
+#   repo PuddleHQ/microsandbox tag v0.7.7-puddle.2 (green), or superradcompany/microsandbox tag
 #   v0.7.7 (stock: every case red). Downloads only; nothing is written anywhere.
 name: puddle repros
 
@@ -24,7 +24,7 @@ on:
       release_repo:
         description: "Repo whose release to test"
         required: true
-        default: TijsVK/microsandbox
+        default: PuddleHQ/microsandbox
         type: string
       release_tag:
         description: "Release tag, e.g. v0.7.7-puddle.2 (or v0.7.7 on superradcompany/microsandbox for stock)"

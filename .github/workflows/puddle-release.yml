@@ -520,11 +520,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          src=$(grep -m1 -o 'git+https://github.com/TijsVK/libkrun?[a-z]*=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
+          src=$(grep -m1 -o 'git+https://github.com/PuddleHQ/libkrun?[a-z]*=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
           sha=${src##*#}
           echo "libkrun source from Cargo.lock: $src"
           git init -q libkrun
-          git -C libkrun fetch -q --depth 1 https://github.com/TijsVK/libkrun "$sha"
+          git -C libkrun fetch -q --depth 1 https://github.com/PuddleHQ/libkrun "$sha"
           git -C libkrun checkout -q FETCH_HEAD
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
@@ -652,11 +652,11 @@ jobs:
       - name: Checkout the locked libkrun fork commit
         run: |
           set -euo pipefail
-          src=$(grep -m1 -o 'git+https://github.com/TijsVK/libkrun?[a-z]*=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
+          src=$(grep -m1 -o 'git+https://github.com/PuddleHQ/libkrun?[a-z]*=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
           sha=${src##*#}
           echo "libkrun source from Cargo.lock: $src"
           git init -q libkrun
-          git -C libkrun fetch -q --depth 1 https://github.com/TijsVK/libkrun "$sha"
+          git -C libkrun fetch -q --depth 1 https://github.com/PuddleHQ/libkrun "$sha"
           git -C libkrun checkout -q FETCH_HEAD
 
       - name: msb_krun_devices virtio tests

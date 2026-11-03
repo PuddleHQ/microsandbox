@@ -270,7 +270,7 @@ jobs:
                 jq -e --arg l "$leg" '.[$l]' "$c" >/dev/null && jq -r --arg l "$leg" '.[$l] | "- push \(.url) branch \(.branch) = \(.sha)"' "$c"
               done
               jq -r '.msb | "- push branch puddle-bump/v'"$VERSION"' = \(.merge) and open the PR into puddle\n- fast-forward puddle \(.old) -> \(.merge)\n- tag v'"$VERSION"' = \(.sha) and publish the release from this run'"'"'s artifacts"' "$c"
-              echo "- open the pin-bump PR in TijsVK/puddle (PUDDLE_PIN_TOKEN: $HAS_PIN_TOKEN; skipped without it)"
+              echo "- open the pin-bump PR in PuddleHQ/puddle (PUDDLE_PIN_TOKEN: $HAS_PIN_TOKEN; skipped without it)"
             else
               echo "A real run would open or update the issue \"auto-bump: $REL\" with the verdict ($V), the replay summary and $RUN_URL."
             fi

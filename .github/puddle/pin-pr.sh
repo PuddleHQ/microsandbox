@@ -3,7 +3,7 @@
 # pin-pr.sh - open the pin-bump PR in the puddle product repo for a new fork tag (fork-only file).
 #
 # usage: PIN_TOKEN=... pin-pr.sh <new version, e.g. 0.7.8-puddle.1> <release url>
-# PIN_TOKEN: fine-grained token for TijsVK/puddle only (Contents + Pull requests read/write), secret
+# PIN_TOKEN: fine-grained token for PuddleHQ/puddle only (Contents + Pull requests read/write), secret
 # PUDDLE_PIN_TOKEN (puddle D-60). Changes on a branch off `develop`: BUILT_FOR in
 # crates/puddle-runtime/src/version.rs, and every `v<old>` / `=<old>` fork pin in the root Cargo.toml
 # (Cargo.lock refreshed), and the new tag's pin lines in ci/msb-runtime.sha256 (the release's
@@ -12,7 +12,7 @@
 # a fork tag stays a deliberate step.
 set -euo pipefail
 new=$1 release_url=$2
-repo=TijsVK/puddle
+repo=PuddleHQ/puddle
 w=$(mktemp -d)
 git clone -q --depth 1 --branch develop "https://x-access-token:${PIN_TOKEN}@github.com/$repo.git" "$w/puddle"
 cd "$w/puddle"
@@ -30,7 +30,7 @@ if ! git diff --quiet -- Cargo.toml; then cargo metadata --format-version 1 >/de
 pins=ci/msb-runtime.sha256
 if [ -f "$pins" ] && ! grep -q "^v$new " "$pins"; then
   sums=$(curl -fsSL "${release_url/\/tag\//\/download\/}/checksums.sha256") || { echo "::error::no checksums.sha256 in $release_url"; exit 1; }
-  src=$(curl -fsSL -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/TijsVK/microsandbox/commits/v$new")
+  src=$(curl -fsSL -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/PuddleHQ/microsandbox/commits/v$new")
   fw=$(sed -n "s/^v$old libkrunfw-linux-version //p" "$pins")
   [ -n "$src" ] && [ -n "$fw" ] || { echo "::error::no source commit or firmware version for v$new"; exit 1; }
   { printf '%s\n' "$sums" | awk -v t="v$new" 'NF == 2 { print t, $2, $1 }'
@@ -52,4 +52,4 @@ GH_TOKEN=$PIN_TOKEN gh pr create -R "$repo" --base develop --head "$branch" \
 
 Before merging: CI green, then run \`ci/windows-e2e.ps1\` on the laptop (W7: before every msb bump), and \`cargo xtask runtime --tag v$new\`.
 
-Opened by TijsVK/microsandbox's puddle-autobump workflow."
+Opened by PuddleHQ/microsandbox's puddle-autobump workflow."

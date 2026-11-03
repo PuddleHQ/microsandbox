@@ -5,7 +5,7 @@
 # and the mount root is resolved as a `\\?\` path. puddle-release.yml runs the same tests in
 # its `test-windows` job.
 #
-#   gh workflow run puddle-windows-share-names.yml -R TijsVK/microsandbox --ref <branch>
+#   gh workflow run puddle-windows-share-names.yml -R PuddleHQ/microsandbox --ref <branch>
 name: puddle windows share names
 
 on:

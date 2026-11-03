@@ -3,8 +3,8 @@
 # land.sh - publish an auto-bump candidate whose gates passed (fork-only file).
 #
 # usage: land.sh <candidate dir> <version, e.g. 0.7.8-puddle.1> <upstream tag>
-# Run in a full clone of TijsVK/microsandbox. <candidate dir> is the run's `puddle-candidate`
-# artifact (gh run download <run id> -R TijsVK/microsandbox -n puddle-candidate -D <dir>).
+# Run in a full clone of PuddleHQ/microsandbox. <candidate dir> is the run's `puddle-candidate`
+# artifact (gh run download <run id> -R PuddleHQ/microsandbox -n puddle-candidate -D <dir>).
 #
 # 1. libkrun / russh legs (if replayed): push branch puddle-<base version> (libkrun also gets tag
 #    msb_krun-v<base version>-puddle.<n>). Never forced: an existing branch must already match.
@@ -47,7 +47,7 @@ for leg in libkrun russh; do
   [ -n "$(field "$leg" bundle)" ] || continue
   check_branch "$(field "$leg" url)" "$(field "$leg" branch)" "$(field "$leg" sha)"
 done
-check_branch "https://github.com/${GITHUB_REPOSITORY:-TijsVK/microsandbox}" "puddle-bump/$tag" "$(field msb merge)"
+check_branch "https://github.com/${GITHUB_REPOSITORY:-PuddleHQ/microsandbox}" "puddle-bump/$tag" "$(field msb merge)"
 
 for leg in libkrun russh; do
   b=$(field "$leg" bundle)
@@ -77,7 +77,7 @@ sha=$(field msb sha); merge=$(field msb merge); old=$(field msb old)
 git fetch -q --no-tags "https://github.com/${UPSTREAM_REPO:-superradcompany/microsandbox}" "refs/tags/$up_tag:refs/tags/$up_tag"
 git fetch -q --no-tags "$d/msb.bundle" "+refs/heads/puddle-candidate:refs/puddle-bump/tip"
 git fetch -q --no-tags "$d/msb-merge.bundle" "+refs/heads/puddle-candidate-merge:refs/puddle-bump/merge"
-slug=${GITHUB_REPOSITORY:-TijsVK/microsandbox}
+slug=${GITHUB_REPOSITORY:-PuddleHQ/microsandbox}
 bump="puddle-bump/$tag"
 push_new_branch . "$(remote "$slug")" "$bump" "$merge"
 

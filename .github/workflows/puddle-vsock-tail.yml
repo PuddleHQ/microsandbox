@@ -1,14 +1,14 @@
 # puddle fork: tail loss on Unix-socket vsock routes (microsandbox#1753 and its guest-to-host
 # mirror) on a hosted Linux runner with KVM (puddle T-155). Fork-only file; puddle-release.yml calls it as a gate (its `ref`: the tag; the stock control only reports).
 #
-# Builds msb for Linux from this commit (optionally against another TijsVK/libkrun commit) and runs
+# Builds msb for Linux from this commit (optionally against another PuddleHQ/libkrun commit) and runs
 # tests/puddle/vsock-tail.sh against it in a real microVM. The same cases also run against
 # upstream's stock release as a control (msb_krun 0.1.40 on v0.7.7: no libkrun #152).
 #
 # A libkrun change can also be tried by pushing a vsock-tail/<name> branch whose Cargo.toml and
 # Cargo.lock point at it.
 #
-#   gh workflow run puddle-vsock-tail.yml -R TijsVK/microsandbox --ref <branch> \
+#   gh workflow run puddle-vsock-tail.yml -R PuddleHQ/microsandbox --ref <branch> \
 #     [-f libkrun_rev=<sha>] [-f stock_tag=v0.7.7] [-f cases='h2g-close 1000 1048576']
 name: puddle vsock tail
 
@@ -38,7 +38,7 @@ on:
   workflow_dispatch:
     inputs:
       libkrun_rev:
-        description: "TijsVK/libkrun commit to build against instead of Cargo.lock's (empty: the lock)"
+        description: "PuddleHQ/libkrun commit to build against instead of Cargo.lock's (empty: the lock)"
         required: false
         default: ""
         type: string
@@ -98,7 +98,7 @@ jobs:
           set -euo pipefail
           [[ "$REV" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::libkrun_rev must be a commit sha"; exit 1; }
           # '#' as the delimiter: with '|' the alternation's \| is read as a literal '|' and nothing matches.
-          sed -i "s#git = \"https://github.com/TijsVK/libkrun\", \(branch\|tag\) = \"[^\"]*\"#git = \"https://github.com/TijsVK/libkrun\", rev = \"$REV\"#" Cargo.toml
+          sed -i "s#git = \"https://github.com/PuddleHQ/libkrun\", \(branch\|tag\) = \"[^\"]*\"#git = \"https://github.com/PuddleHQ/libkrun\", rev = \"$REV\"#" Cargo.toml
           grep -c "rev = \"$REV\"" Cargo.toml
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

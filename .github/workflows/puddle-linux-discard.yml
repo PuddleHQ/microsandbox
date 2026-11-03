@@ -9,7 +9,7 @@
 # run against upstream's stock release as a control: it refuses ("the discard operation is not
 # supported") and keeps ~1 GiB, so a pass of the fork run is not vacuous.
 #
-#   gh workflow run puddle-linux-discard.yml -R TijsVK/microsandbox --ref <branch> [-f stock_tag=v0.7.7]
+#   gh workflow run puddle-linux-discard.yml -R PuddleHQ/microsandbox --ref <branch> [-f stock_tag=v0.7.7]
 name: puddle linux discard
 
 on:
