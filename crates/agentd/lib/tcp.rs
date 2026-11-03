@@ -632,6 +632,21 @@ async fn relay_tcp_session(
                         }
                     }
                     Err(e) => {
+                        // Records already admitted may still be crossing the bulk lane. A finish
+                        // with their end offset lets the host deliver them before the failure.
+                        if let Some(state) = bulk.as_mut()
+                            && let Ok(finish) = state.send.finish()
+                        {
+                            send_raw_tcp_message(
+                                id,
+                                MessageType::BulkFinish,
+                                &finish,
+                                RawActivity::guest_message(),
+                                None,
+                                &tx,
+                            )
+                            .await;
+                        }
                         terminal_sent = send_raw_tcp_message(
                             id,
                             MessageType::TcpFailed,
@@ -1669,5 +1684,70 @@ mod tests {
             panic!("expected SessionOutput::Bulk record");
         };
         output.record
+    }
+
+    /// A destination that resets after sending must still yield a finish with the
+    /// admitted offset ahead of the failure, so the host relay can wait for the last record.
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn reset_after_data_sends_finish_before_failure() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (session_tx, mut session_rx) = SessionOutputSender::channel();
+        let payload = vec![7u8; 64 * 1024];
+        let sent = payload.clone();
+        let accept_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&sent).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            socket.set_linger(Some(Duration::ZERO)).unwrap();
+            drop(socket);
+        });
+        let session = TcpSession::open(
+            21,
+            TcpConnect {
+                host: "127.0.0.1".to_string(),
+                port,
+                bulk: Some(BulkOffer::tcp()),
+            },
+            &session_tx,
+        );
+        assert_eq!(
+            recv_message(&mut session_rx).await.t,
+            MessageType::TcpConnected
+        );
+        assert_eq!(
+            recv_message(&mut session_rx).await.t,
+            MessageType::BulkAccepted
+        );
+        let mut bytes = 0u64;
+        let mut finish = None;
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let envelope = session_rx.recv().await.unwrap();
+                match envelope.output {
+                    SessionOutput::Bulk(output) => bytes += output.record.payload.len() as u64,
+                    SessionOutput::Raw(mut output) => {
+                        let msg = decode_one_message(&mut output.frame);
+                        match msg.t {
+                            MessageType::BulkFinish => {
+                                finish = Some(msg.payload::<BulkFinish>().unwrap().final_offset)
+                            }
+                            MessageType::BulkCredit => {}
+                            other => return other,
+                        }
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        accept_task.await.unwrap();
+        assert_eq!(terminal, MessageType::TcpFailed);
+        assert_eq!(bytes, payload.len() as u64);
+        assert_eq!(finish, Some(bytes), "no finish ahead of the failure");
+        session.close();
     }
 }
