@@ -1,0 +1,191 @@
+# puddle fork: the root-disk journal is out of the guest's reach (GHSA-3f94-vm6x-3jv3, fixed upstream in
+# v0.7.12) and a sandbox made by an older release migrates safely, on a hosted Linux runner with KVM.
+# puddle-release.yml calls this as a gate (its `ref`: the tag).
+#
+# Builds agentd (musl) and msb for Linux from this commit and runs tests/puddle/root-journal.sh: the
+# guest sees no journal through /.msb, a journal the guest rewrote is ignored, and a sandbox made by
+# upstream v0.7.8 starts on this build (plain) or is refused when its guest had rewritten the journal
+# (armed). Writes by a host user are out of scope for the protection and are not tested.
+#
+# With `test_tag` the run tests that upstream release instead of a build from this commit (a check that
+# the cases hold on the stock release).
+#
+#   gh workflow run puddle-root-journal.yml -R PuddleHQ/microsandbox --ref <branch> [-f test_tag=v0.7.12]
+
+name: puddle root journal
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit or tag to test (empty: the ref of the run; puddle release passes its tag)"
+        required: false
+        default: ""
+        type: string
+      test_tag:
+        description: "Upstream release to test instead of a build from the ref (empty: build)"
+        required: false
+        default: ""
+        type: string
+      old_tag:
+        description: "Upstream release from before the protection, for the upgrade cases"
+        required: false
+        default: v0.7.8
+        type: string
+  workflow_dispatch:
+    inputs:
+      test_tag:
+        description: "Upstream release to test instead of a build from this ref (empty: build)"
+        required: false
+        default: ""
+        type: string
+      old_tag:
+        description: "Upstream release from before the protection, for the upgrade cases"
+        required: false
+        default: v0.7.8
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: superradcompany/microsandbox
+
+jobs:
+  build:
+    name: Build agentd + msb (Linux)
+    if: ${{ inputs.test_tag == '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Upstream release of this fork version
+        id: up
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "tag=v${version%%-puddle.*}" >> "$GITHUB_OUTPUT"
+          echo "fork version $version, upstream v${version%%-puddle.*}"
+
+      - name: libkrunfw from upstream ${{ steps.up.outputs.tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$UPSTREAM_REPO" -D dl -p checksums.sha256 -p libkrunfw-linux-x86_64.so
+          bash .github/puddle/verify-asset.sh dl/checksums.sha256 dl/libkrunfw-linux-x86_64.so libkrunfw-linux-x86_64.so
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          shared-key: puddle-msb-linux
+
+      # The guest agent from this commit's source: its per-client limit must match the msb that embeds it.
+      - name: Build agentd, then msb with it embedded
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -y -q libcap-ng-dev musl-tools
+          cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target-dir target-agentd \
+            --target x86_64-unknown-linux-musl
+          mkdir -p embed rt
+          cp target-agentd/x86_64-unknown-linux-musl/release/agentd embed/agentd
+          MSB_EMBED_ARTIFACTS_DIR="$PWD/embed" cargo build --locked --release --no-default-features \
+            --features embed-binaries,net,ssh -p microsandbox-cli
+          fw=$(sed -n 's/.*LIBKRUNFW_VERSION: &str = "\(.*\)";/\1/p' crates/utils/lib/lib.rs)
+          cp target/release/msb rt/msb
+          cp dl/libkrunfw-linux-x86_64.so "rt/libkrunfw.so.$fw"
+          ./rt/msb --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-linux
+          path: rt/
+          compression-level: 1
+
+  journal:
+    name: root journal
+    needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+
+      - name: KVM
+        run: |
+          set -euo pipefail
+          [ -e /dev/kvm ] || { echo "::error::/dev/kvm is missing on this runner (infrastructure)"; exit 1; }
+          # Hosted runners ship /dev/kvm root-only; open it to the runner user.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.test_tag == '' }}
+        with:
+          name: msb-linux
+          path: rt
+
+      - name: Upstream releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_TAG: ${{ inputs.test_tag }}
+          OLD_TAG: ${{ inputs.old_tag || 'v0.7.8' }}
+        run: |
+          set -euo pipefail
+          # fetch <tag> <dir>: msb looks for libkrunfw.so.<LIBKRUNFW_VERSION of its source> beside itself.
+          fetch() {
+            local tag=$1 dir=$2 fw
+            gh release download "$tag" -R "$UPSTREAM_REPO" -D "dl-$tag" \
+              -p checksums.sha256 -p msb-linux-x86_64 -p libkrunfw-linux-x86_64.so
+            bash .github/puddle/verify-asset.sh "dl-$tag/checksums.sha256" "dl-$tag/msb-linux-x86_64" msb-linux-x86_64
+            bash .github/puddle/verify-asset.sh "dl-$tag/checksums.sha256" "dl-$tag/libkrunfw-linux-x86_64.so" libkrunfw-linux-x86_64.so
+            fw=$(gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/$UPSTREAM_REPO/contents/crates/utils/lib/lib.rs?ref=$tag" \
+              | sed -n 's/.*LIBKRUNFW_VERSION: &str = "\(.*\)";/\1/p')
+            [ -n "$fw" ] || { echo "::error::no LIBKRUNFW_VERSION in $tag"; exit 1; }
+            mkdir -p "$dir"
+            cp "dl-$tag/msb-linux-x86_64" "$dir/msb"
+            cp "dl-$tag/libkrunfw-linux-x86_64.so" "$dir/libkrunfw.so.$fw"
+          }
+          fetch "$OLD_TAG" rt-old
+          if [ -n "$TEST_TAG" ]; then fetch "$TEST_TAG" rt; fi
+          chmod +x rt/msb rt-old/msb
+          ls -l rt rt-old
+
+      - name: Run the cases
+        run: |
+          # Not -e (the shell's default here): the exit code is judged below.
+          set +e -uo pipefail
+          bash tests/puddle/root-journal.sh rt "$RUNNER_TEMP/w" rt-old 2>&1 | tee "$RUNNER_TEMP/journal.log"
+          code=${PIPESTATUS[0]}
+          echo "root-journal.sh exit $code"
+          exit "$code"
+
+      - name: Keep logs
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p keep
+          cp "$RUNNER_TEMP/journal.log" "$RUNNER_TEMP"/w/*.log "$RUNNER_TEMP"/w/*.json keep/ 2>/dev/null || true
+          find "$RUNNER_TEMP/w/home" -path '*/logs/*' -name '*.log' -exec cp --parents {} keep/ \; 2>/dev/null || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: root-journal
+          path: keep/
