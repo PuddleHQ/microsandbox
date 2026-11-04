@@ -1,10 +1,14 @@
-# puddle fork: build msb.exe for Windows (MSVC) from a v<release>-puddle.N tag, test it,
-# and publish it as a release asset next to upstream's libkrunfw.dll and the fork-built agentd.
+# puddle fork: build msb.exe and libkrunfw.dll for Windows (MSVC) from a v<release>-puddle.N tag,
+# test them, and publish them as release assets next to the fork-built agentd.
 # The Linux msb is built from the same tag (build-linux) and published with upstream's Linux
 # libkrunfw, so Puddle's CI downloads it instead of building it (about 8 minutes per cache miss).
 #
-# Fork-only file (not in upstream). The kernel and libkrunfw stay upstream's: they are downloaded
-# from the matching upstream release and checked against its checksums.sha256. agentd is built here
+# Fork-only file (not in upstream). The Linux libkrunfw stays upstream's: it is downloaded from the
+# matching upstream release and checked against its checksums.sha256. The Windows libkrunfw.dll is
+# built here (firmware-windows, build-windows) from the tag's vendor/libkrunfw with the kernel
+# config of the Linux firmware (config-libkrunfw_x86_64), as upstream did up to v0.7.8: upstream's
+# Windows kernel config (config-libkrunfw-windows_x86_64, used since v0.7.12) has no netfilter, so
+# iptables, nft and dockerd fail in the guest. agentd is built here
 # (musl, x86_64) from the same source as msb, because the fork changes code that runs in the guest
 # (the per-client forward limit) and the host and guest must agree on it.
 #
@@ -144,7 +148,7 @@ jobs:
           echo "prev_tag=$prev" >> "$GITHUB_OUTPUT"
           echo "previous fork release for the volume check: ${prev:-none}"
 
-      - name: Download upstream libkrunfw (Windows, Linux), agentd, checksums
+      - name: Download upstream libkrunfw (Linux), agentd, checksums
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_TAG: ${{ steps.tags.outputs.upstream_tag }}
@@ -152,13 +156,12 @@ jobs:
           set -euo pipefail
           mkdir -p upstream
           gh release download "$UPSTREAM_TAG" -R "$UPSTREAM_REPO" -D upstream \
-            -p checksums.sha256 -p libkrunfw-windows-x86_64.dll -p libkrunfw-linux-x86_64.so -p agentd-x86_64
+            -p checksums.sha256 -p libkrunfw-linux-x86_64.so -p agentd-x86_64
 
       - name: Verify against upstream checksums.sha256
         run: |
           set -euo pipefail
           v=.github/puddle/verify-asset.sh
-          bash "$v" upstream/checksums.sha256 upstream/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
           bash "$v" upstream/checksums.sha256 upstream/libkrunfw-linux-x86_64.so libkrunfw-linux-x86_64.so
           bash "$v" upstream/checksums.sha256 upstream/agentd-x86_64 agentd-x86_64
           # Self-test: a file with one byte changed must be refused.
@@ -244,9 +247,60 @@ jobs:
           path: out/agentd-x86_64
           compression-level: 0
 
+  # The guest kernel for the Windows libkrunfw.dll, built from the tag's vendor/libkrunfw with the
+  # Linux firmware's kernel config (no OS=Windows): the same kernel config as the Linux libkrunfw.
+  firmware-windows:
+    name: Windows guest kernel (Linux kernel config)
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Kernel source (checked against kernel.org's sha256sums)
+        uses: ./.github/actions/cache-libkrunfw-kernel
+
+      - name: Install firmware build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
+
+      - name: Build kernel.c
+        working-directory: vendor/libkrunfw
+        run: make -j"$(nproc)" kernel.c
+
+      # The point of this job: the guest must have netfilter (iptables, nft, dockerd's bridge).
+      - name: Kernel config has netfilter
+        working-directory: vendor/libkrunfw
+        run: |
+          set -euo pipefail
+          cfg=$(ls -d linux-*/.config)
+          for opt in CONFIG_NETFILTER CONFIG_NF_TABLES CONFIG_NF_NAT CONFIG_IP_NF_IPTABLES CONFIG_BRIDGE CONFIG_VETH; do
+            grep -qx "$opt=y" "$cfg" || { echo "::error::$opt is not built in ($cfg)"; exit 1; }
+          done
+          echo "netfilter options built in: $cfg"
+          sha256sum kernel.c
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: puddle-kernel-windows
+          path: vendor/libkrunfw/kernel.c
+          compression-level: 6
+
   build-windows:
     name: Build msb.exe + boot smoke (windows-2025)
-    needs: [prepare, build-agentd]
+    needs: [prepare, build-agentd, firmware-windows]
     runs-on: windows-2025
     timeout-minutes: 90
     steps:
@@ -303,6 +357,25 @@ jobs:
           name: puddle-agentd
           path: agentd/
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: puddle-kernel-windows
+          path: vendor/libkrunfw/
+
+      # Upstream's release-windows.yml "Build libkrunfw.dll" step, on this run's kernel.c.
+      - name: Build libkrunfw.dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\vendor\libkrunfw\scripts\build-windows.ps1 `
+            -SkipKernelBundle `
+            -AbiVersion 5 `
+            -Architecture amd64 `
+            -HostArchitecture amd64 `
+            -Output libkrunfw.dll `
+            -ImportLibrary libkrunfw.lib
+          (Get-FileHash vendor\libkrunfw\libkrunfw.dll -Algorithm SHA256).Hash
+
       # embed-binaries takes the prebuilt agentd from MSB_EMBED_ARTIFACTS_DIR (named `agentd`).
       - name: Stage this run's agentd for embedding
         shell: pwsh
@@ -326,7 +399,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path out, runtime | Out-Null
           Copy-Item "target\$env:RUST_TARGET\release\msb.exe" out\msb-windows-x86_64.exe -Force
           Copy-Item out\msb-windows-x86_64.exe runtime\msb.exe -Force
-          Copy-Item upstream\libkrunfw-windows-x86_64.dll runtime\libkrunfw.dll -Force
+          Copy-Item vendor\libkrunfw\libkrunfw.dll out\libkrunfw-windows-x86_64.dll -Force
+          Copy-Item out\libkrunfw-windows-x86_64.dll runtime\libkrunfw.dll -Force
 
       # The Windows-only bootstrap root (crates/runtime/lib/runner/bootstrap_fs.rs) has no other CI:
       # its mountpoints keep PID 1 alive when the kernel starts it without a console (T-164). The
@@ -384,7 +458,9 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: msb-windows-x86_64
-          path: out/msb-windows-x86_64.exe
+          path: |
+            out/msb-windows-x86_64.exe
+            out/libkrunfw-windows-x86_64.dll
           compression-level: 0
 
   # The Linux msb, built from the tag's own source like the Windows one, embedding this run's agentd.
