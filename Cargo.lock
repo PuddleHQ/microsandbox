@@ -4377,8 +4377,7 @@ dependencies = [
 [[package]]
 name = "msb-imago"
 version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b6feac477a4387d62fde89aad52900fa0ea7ccb4fec686f50b93a575cbf0ea5"
+source = "git+https://github.com/PuddleHQ/imago?tag=v0.1.7-puddle.1#e528d65caf49ed0e117eb29ffae1d9e6efc95d25"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -4407,8 +4406,7 @@ dependencies = [
 [[package]]
 name = "msb_krun"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cc8c72e61d6342ed8f381f049e5659c3c3c7a2d589eb2407f4abecc5aa633f2"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "crossbeam-channel",
  "kvm-bindings",
@@ -4427,8 +4425,7 @@ dependencies = [
 [[package]]
 name = "msb_krun_arch"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac38ac5290daf53011289f0b3420ce69e577db101b39fa4ac8c73869635dc9e1"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -4442,14 +4439,12 @@ dependencies = [
 [[package]]
 name = "msb_krun_arch_gen"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "372c943ecdd64cc741630ff76a4763aad41732f62dba368be0f530b83373ec85"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 
 [[package]]
 name = "msb_krun_cpuid"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef38e1dc441567a43111aceade3837b7111d29c1f8c1ca6dd5f4ff82e92b6824"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -4459,8 +4454,7 @@ dependencies = [
 [[package]]
 name = "msb_krun_devices"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a030aa4be892ea9b2215c2828d2ce02d77d4b02133f0af6dc842bae5a802ed87"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "bincode",
  "bitflags 1.3.2",
@@ -4490,8 +4484,7 @@ dependencies = [
 [[package]]
 name = "msb_krun_hvf"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7eafee262ce993bafc612abb3dd6582c102f0f462f15fb22159bf04184dc908"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "crossbeam-channel",
  "libloading 0.8.9",
@@ -4503,8 +4496,7 @@ dependencies = [
 [[package]]
 name = "msb_krun_kernel"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51ad8e40e3fe51a18effce0245e099c318e8302e851e7917eef296d46bbe143d"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "msb-vm-memory",
  "msb_krun_utils",
@@ -4513,8 +4505,7 @@ dependencies = [
 [[package]]
 name = "msb_krun_polly"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fad6d7aae45e030546e31349f1c8fe2d257223b95360f84ca80b6bc0ef232f22"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "libc",
  "msb_krun_utils",
@@ -4523,8 +4514,7 @@ dependencies = [
 [[package]]
 name = "msb_krun_smbios"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd434257469b722d2920d179a5a927b09e795c95035eca01674c5033bf83caa"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "msb-vm-memory",
 ]
@@ -4532,8 +4522,7 @@ dependencies = [
 [[package]]
 name = "msb_krun_utils"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b4ecd659171dc62624ff73007f5abdf4fffaf48131ef00fed1ea3d164fb2e6f"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "bitflags 1.3.2",
  "crossbeam-channel",
@@ -4548,8 +4537,7 @@ dependencies = [
 [[package]]
 name = "msb_krun_vmm"
 version = "0.1.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "284e283d6f1b5e5496afe615c6a4912e41b8b0210d40b1e7d4e0647a59ed6175"
+source = "git+https://github.com/PuddleHQ/libkrun?tag=msb_krun-v0.1.42-puddle.1#e0b254783cd487e9307468c1e86ab3c943ab1d04"
 dependencies = [
  "bincode",
  "bzip2",
@@ -5207,9 +5195,8 @@ dependencies = [
 
 [[package]]
 name = "pageant"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8eab09a361a4afe0b1668be978cd97e4f052e927a92b0b608cf902965d49ce"
+version = "0.2.5"
+source = "git+https://github.com/PuddleHQ/russh?tag=v0.65.0-puddle.1#4516cf5ec04cd606ce6d206d966d976f78daa1fd"
 dependencies = [
  "base16ct",
  "byteorder",
@@ -6247,8 +6234,7 @@ dependencies = [
 [[package]]
 name = "russh"
 version = "0.65.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bb77a4b259312b2abbc541bca1c13cb4e9b61c560a7fd894068c3b92e0c9dc3"
+source = "git+https://github.com/PuddleHQ/russh?tag=v0.65.0-puddle.1#4516cf5ec04cd606ce6d206d966d976f78daa1fd"
 dependencies = [
  "aes 0.9.0",
  "aws-lc-rs",
@@ -6318,8 +6304,7 @@ dependencies = [
 [[package]]
 name = "russh-cryptovec"
 version = "0.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aec6cb630dbe85d72ffd7bcd95f07e1bd69f9f270ee8adfa1afe443a6331438"
+source = "git+https://github.com/PuddleHQ/russh?tag=v0.65.0-puddle.1#4516cf5ec04cd606ce6d206d966d976f78daa1fd"
 dependencies = [
  "log",
  "nix 0.31.3",
@@ -6350,8 +6335,7 @@ dependencies = [
 [[package]]
 name = "russh-util"
 version = "0.52.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "668424a5dde0bcb45b55ba7de8476b93831b4aa2fa6947e145f3b053e22c60b6"
+source = "git+https://github.com/PuddleHQ/russh?tag=v0.65.0-puddle.1#4516cf5ec04cd606ce6d206d966d976f78daa1fd"
 dependencies = [
  "chrono",
  "tokio",
