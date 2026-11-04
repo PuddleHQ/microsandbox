@@ -123,6 +123,10 @@ pub fn prepare(runtime_dir: &Path, binding: Option<&LegacyRootBinding>) -> Resul
 /// This is not a migration entry point; callers must own a new catalog creation reservation.
 pub fn initialize_new(runtime_dir: &Path) -> Result<(), String> {
     let sandbox = host_root(runtime_dir)?;
+    // Only image roots create the sandboxes folder before launch; a bind root may be the first.
+    if let Some(sandboxes) = sandbox.parent() {
+        fs::create_dir_all(sandboxes).map_err(|e| e.to_string())?;
+    }
     real_directory(sandbox, true)?;
     real_directory(runtime_dir, true)?;
     if fs::symlink_metadata(sandbox.join(MARKER)).is_ok() {
@@ -505,6 +509,16 @@ mod tests {
             serde_json::to_vec(&value).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_first_sandbox_of_a_fresh_home_gets_its_protected_layout() {
+        // A bind root writes nothing under `sandboxes/` before launch, so in a new home the
+        // first sandbox's parent folder does not exist yet.
+        let home = tempfile::tempdir().unwrap();
+        let runtime = home.path().join("sandboxes").join("first").join("runtime");
+        initialize_new(&runtime).unwrap();
+        require_ready(&runtime).unwrap();
     }
 
     #[test]
