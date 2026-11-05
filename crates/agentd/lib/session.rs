@@ -1068,6 +1068,10 @@ impl ExecSession {
 
         let resolved_user = resolve_requested_user(req, default_user)?;
         let default_home = default_home_dir(req, resolved_user.as_ref())?;
+        let login_env: Vec<(CString, CString)> = default_login_env(req, resolved_user.as_ref())?
+            .into_iter()
+            .filter_map(|(key, value)| Some((CString::new(key).ok()?, value)))
+            .collect();
         let home_key = default_home
             .as_ref()
             .map(|_| {
@@ -1173,6 +1177,12 @@ impl ExecSession {
             if let (Some(key), Some(home)) = (&home_key, &default_home) {
                 unsafe {
                     libc::setenv(key.as_ptr(), home.as_ptr(), 1);
+                }
+            }
+
+            for (key, value) in &login_env {
+                unsafe {
+                    libc::setenv(key.as_ptr(), value.as_ptr(), 1);
                 }
             }
 
@@ -1285,6 +1295,7 @@ impl ExecSession {
         if let Some(home) = default_home_dir(req, resolved_user.as_ref())? {
             cmd.env("HOME", home.to_string_lossy().into_owned());
         }
+        apply_default_login_env(&mut cmd, req, resolved_user.as_ref())?;
 
         // Apply the security profile and resource limits in the child before exec.
         let parsed_rlimits = rlimit::to_libc(&req.rlimits);
@@ -1832,6 +1843,38 @@ fn default_home_dir(
     }
 
     Ok(resolve_user_spec(DEFAULT_USER_SPEC)?.home_dir)
+}
+
+/// `USER` and `LOGNAME` for a session the request did not give them to, the login name of
+/// the account the command runs as, next to the `HOME` default above.
+fn default_login_env(
+    req: &ExecRequest,
+    user: Option<&ResolvedUser>,
+) -> AgentdResult<Vec<(&'static str, CString)>> {
+    let name = match user {
+        Some(user) => user.initgroups_user.clone(),
+        None => resolve_user_spec(DEFAULT_USER_SPEC)?.initgroups_user,
+    };
+    let Some(name) = name else {
+        return Ok(Vec::new());
+    };
+
+    Ok(["USER", "LOGNAME"]
+        .into_iter()
+        .filter(|key| !env_contains_key(&req.env, key))
+        .map(|key| (key, name.clone()))
+        .collect())
+}
+
+fn apply_default_login_env(
+    cmd: &mut Command,
+    req: &ExecRequest,
+    user: Option<&ResolvedUser>,
+) -> AgentdResult<()> {
+    for (key, value) in default_login_env(req, user)? {
+        cmd.env(key, value.to_string_lossy().into_owned());
+    }
+    Ok(())
 }
 
 fn env_contains_key(env: &[String], key: &str) -> bool {
@@ -3008,6 +3051,111 @@ mod tests {
                 .expect("resolve default home")
                 .is_none()
         );
+    }
+
+    fn login_request(env: &[&str]) -> ExecRequest {
+        ExecRequest {
+            cmd: "/bin/true".to_string(),
+            args: Vec::new(),
+            env: env.iter().map(|entry| entry.to_string()).collect(),
+            cwd: None,
+            user: None,
+            tty: false,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        }
+    }
+
+    fn login_pairs(pairs: Vec<(&'static str, CString)>) -> Vec<(&'static str, String)> {
+        pairs
+            .into_iter()
+            .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn test_default_login_env_names_the_resolved_user() {
+        let user = ResolvedUser {
+            uid: 1000,
+            gid: 1000,
+            initgroups_user: Some(CString::new("tester").unwrap()),
+            home_dir: Some(CString::new("/home/tester").unwrap()),
+        };
+
+        assert_eq!(
+            login_pairs(default_login_env(&login_request(&[]), Some(&user)).unwrap()),
+            vec![
+                ("USER", "tester".to_string()),
+                ("LOGNAME", "tester".to_string())
+            ],
+        );
+    }
+
+    #[test]
+    fn test_default_login_env_names_root_when_user_absent() {
+        let root = resolve_user_spec(DEFAULT_USER_SPEC).expect("resolve implicit root");
+        let name = root.initgroups_user.expect("root has a passwd entry");
+        let name = name.to_string_lossy().into_owned();
+
+        assert_eq!(
+            login_pairs(default_login_env(&login_request(&[]), None).unwrap()),
+            vec![("USER", name.clone()), ("LOGNAME", name)],
+        );
+    }
+
+    #[test]
+    fn test_default_login_env_respects_explicit_values() {
+        let user = ResolvedUser {
+            uid: 1000,
+            gid: 1000,
+            initgroups_user: Some(CString::new("tester").unwrap()),
+            home_dir: None,
+        };
+
+        assert_eq!(
+            login_pairs(default_login_env(&login_request(&["USER=custom"]), Some(&user)).unwrap()),
+            vec![("LOGNAME", "tester".to_string())],
+        );
+        assert!(
+            default_login_env(&login_request(&["USER=a", "LOGNAME=b"]), Some(&user))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_default_login_env_skips_an_account_without_a_name() {
+        let user = ResolvedUser {
+            uid: 4242,
+            gid: 4242,
+            initgroups_user: None,
+            home_dir: None,
+        };
+
+        assert!(
+            default_login_env(&login_request(&[]), Some(&user))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_piped_exec_sees_user_and_logname() {
+        let user = ResolvedUser {
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            initgroups_user: Some(CString::new("tester").unwrap()),
+            home_dir: None,
+        };
+        let mut command = StdCommand::new("/usr/bin/env");
+        command.env_clear();
+        apply_default_login_env(&mut command, &login_request(&[]), Some(&user)).unwrap();
+        let output = command.output().expect("run env");
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        assert!(text.lines().any(|line| line == "USER=tester"), "{text}");
+        assert!(text.lines().any(|line| line == "LOGNAME=tester"), "{text}");
     }
 
     #[tokio::test]
