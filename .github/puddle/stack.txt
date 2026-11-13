@@ -45,4 +45,6 @@ pick | fix(vsock): 128 connections per route instead of 256, flood tests | - | -
 pick | test(vsock): guest writes of 4 to 128 KiB per call arrive intact on a route | msb-krun-vsock-multi-descriptor-tx | -
 pick | fix(agentd): give every guest process a SIGTERM and a grace period at shutdown | - | -
 pick | fix(db): open the catalog's first connection outside the pool's connect timeout | - | -
+pick | fix(ssh): start SFTP sessions in the user's home directory | msb-ssh-sftp-home-and-read | -
+pick | fix(ssh): answer zero-length SFTP reads with empty data | msb-ssh-sftp-home-and-read | -
 version | build: version the puddle fork as* | - | -
