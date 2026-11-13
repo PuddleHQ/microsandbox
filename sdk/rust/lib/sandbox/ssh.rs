@@ -2239,6 +2239,15 @@ impl russh_sftp::server::Handler for SftpServerSession {
         len: u32,
     ) -> Result<russh_sftp::protocol::Data, Self::Error> {
         let handle = self.resolve_handle(&handle)?;
+        // A zero-length read is not end of file. OpenSSH answers it with empty data, and
+        // sshj sends one whenever the caller's buffer is full (the JDK's readAllBytes does
+        // that every 16 KiB), so EOF here cut every download at the first full buffer.
+        if len == 0 {
+            return Ok(russh_sftp::protocol::Data {
+                id,
+                data: Vec::new(),
+            });
+        }
         let len = len.min(FS_CHUNK_SIZE as u32);
         let data = sftp_read_handle(&self.client, handle, offset, Some(len as u64))
             .await
@@ -4110,6 +4119,75 @@ mod tests {
             let user = fields.get("user").or_else(|| fields["options"].get("user"));
             assert_eq!(user, Some(&serde_json::json!("alice")), "{name}: {fields}");
         }
+    }
+
+    #[tokio::test]
+    async fn sftp_zero_length_read_returns_empty_data() {
+        use microsandbox_protocol::{
+            codec,
+            core::Ready,
+            fs::{FsRequest, FsResponse, FsResponseData},
+            message::{Message, MessageType},
+        };
+        use russh_sftp::{
+            protocol::{FileAttributes, OpenFlags},
+            server::Handler,
+        };
+
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        tokio::spawn(async move {
+            server_io.write_all(&1u32.to_be_bytes()).await.unwrap();
+            server_io.write_all(&1024u32.to_be_bytes()).await.unwrap();
+            let ready = Message::with_payload(MessageType::Ready, 0, &Ready::default()).unwrap();
+            codec::write_message(&mut server_io, &ready).await.unwrap();
+            while let Ok(message) = codec::read_message(&mut server_io).await {
+                let request: FsRequest = message.payload().unwrap();
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(&request.op).unwrap());
+                let response = FsResponse {
+                    ok: true,
+                    error: None,
+                    data: Some(FsResponseData::Handle(1)),
+                };
+                let reply =
+                    Message::with_payload(MessageType::FsResponse, message.id, &response).unwrap();
+                codec::write_message(&mut server_io, &reply).await.unwrap();
+            }
+        });
+        let client = AgentClient::connect_stream_with_timeout(client_io, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut sftp = SftpServerSession {
+            client: Arc::new(client),
+            cwd: "/".to_string(),
+            user: None,
+            next_handle: 0,
+            handles: HashMap::new(),
+        };
+
+        let handle = sftp
+            .open(
+                1,
+                "/tmp/file".into(),
+                OpenFlags::READ,
+                FileAttributes::empty(),
+            )
+            .await
+            .unwrap()
+            .handle;
+        let data = sftp.read(2, handle, 16384, 0).await.unwrap();
+
+        assert_eq!(data.id, 2);
+        assert!(data.data.is_empty());
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.iter().all(|op| op.get("Read").is_none()),
+            "a zero-length read must not reach the guest: {requests:?}"
+        );
     }
 
     #[test]
