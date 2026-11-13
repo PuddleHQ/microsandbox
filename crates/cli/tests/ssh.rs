@@ -300,6 +300,82 @@ async fn msb_ssh_serve_reports_sftp_exit_status_to_scp() {
     assert_eq!(downloaded.expect("read downloaded file"), b"scp-ok");
 }
 
+#[msb_test]
+async fn msb_ssh_serve_sftp_starts_in_the_home_directory() {
+    if !command_exists("sftp") {
+        eprintln!("skipping OpenSSH sftp test; sftp is not installed");
+        return;
+    }
+
+    let name = "cli-ssh-sftp-home";
+    let sandbox = Sandbox::builder(name)
+        .image("mirror.gcr.io/library/alpine")
+        .cpus(1)
+        .memory(512)
+        .replace()
+        .create()
+        .await
+        .expect("create sandbox");
+
+    let temp = make_temp_dir("msb-ssh-sftp-home");
+    let key_path = temp.join("id_ed25519");
+    let authorized_key = write_test_key(&key_path);
+    command_ok(
+        Command::new(env!("CARGO_BIN_EXE_msb")).args([
+            "ssh",
+            "authorize",
+            "--key",
+            &authorized_key,
+        ]),
+        "authorize OpenSSH test key",
+    )
+    .expect("authorize OpenSSH test key");
+
+    // `pwd` shows where the subsystem starts; the relative `get` has to resolve from there.
+    let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let upload_path = temp.join("upload.bin");
+    let download_path = temp.join("download.bin");
+    std::fs::write(&upload_path, &payload).expect("write sftp payload");
+    let batch = temp.join("batch");
+    std::fs::write(
+        &batch,
+        format!(
+            "pwd\nput {} home-payload.bin\nget home-payload.bin {}\n",
+            upload_path.display(),
+            download_path.display()
+        ),
+    )
+    .expect("write sftp batch");
+    let output = openssh_command("sftp", name, &key_path)
+        .arg("-b")
+        .arg(&batch)
+        .arg("root@msb-sftp")
+        .output()
+        .expect("run sftp");
+    let in_home = sandbox
+        .shell("test -f /root/home-payload.bin && echo yes")
+        .await
+        .map(|out| out.stdout().unwrap_or_default());
+    let downloaded = std::fs::read(&download_path);
+
+    cleanup_sandbox(sandbox, name).await;
+    let _ = std::fs::remove_dir_all(&temp);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "sftp failed: status={:?} stdout={stdout} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Remote working directory: /root"),
+        "sftp did not start in the home directory: {stdout}"
+    );
+    assert_eq!(in_home.expect("check upload in home").trim(), "yes");
+    assert_eq!(downloaded.expect("read downloaded file"), payload);
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------

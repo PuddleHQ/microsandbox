@@ -1889,7 +1889,7 @@ impl russh::server::Handler for SshSession {
             return Ok(());
         }
 
-        let cwd = self
+        let workdir = self
             .settings
             .sandbox
             .config()
@@ -1898,9 +1898,7 @@ impl russh::server::Handler for SshSession {
             .workdir
             .as_deref()
             .filter(|path| !path.is_empty() && path.starts_with('/'))
-            .map(str::to_string)
-            .clone()
-            .unwrap_or_else(|| "/".to_string());
+            .map(str::to_string);
         // Root sessions keep the agent's own identity; others act as the same user as exec.
         let user = self
             .settings
@@ -1908,16 +1906,23 @@ impl russh::server::Handler for SshSession {
             .clone()
             .or_else(|| self.user.clone())
             .filter(|user| user != "root");
-        let sftp = SftpServerSession {
-            client,
-            cwd,
-            user,
-            next_handle: 0,
-            handles: HashMap::new(),
-        };
         self.channels.insert(channel, ChannelState::Sftp);
         session.channel_success(channel)?;
         tokio::spawn(async move {
+            // Like OpenSSH's sftp-server, start in the user's home. Images set a workdir for
+            // their entrypoint (often "/"), so it is only the fallback. Resolved here, not in
+            // the handler, so the guest round trip never holds the session loop.
+            let cwd = sftp_home_dir(&client, user.as_deref())
+                .await
+                .or(workdir)
+                .unwrap_or_else(|| "/".to_string());
+            let sftp = SftpServerSession {
+                client,
+                cwd,
+                user,
+                next_handle: 0,
+                handles: HashMap::new(),
+            };
             russh_sftp::server::run(channel_stream.into_stream(), sftp).await;
         });
         Ok(())
@@ -3220,6 +3225,44 @@ async fn sftp_close_handle(
     sftp_simple_op(client, FsOp::CloseHandle { handle }).await
 }
 
+/// The guest home directory of `user` (`None` is the agent's own identity, root), if the
+/// guest's passwd file has one.
+async fn sftp_home_dir(client: &Arc<AgentClient>, user: Option<&str>) -> Option<String> {
+    let options = FsOpenOptions {
+        read: true,
+        ..Default::default()
+    };
+    let passwd = match sftp_open_file(client, "/etc/passwd", options).await {
+        Ok(handle) => {
+            let data = sftp_read_handle(client, handle, 0, None).await;
+            let _ = sftp_close_handle(client, handle).await;
+            data.ok()
+        }
+        Err(_) => None,
+    };
+    passwd.and_then(|passwd| passwd_home(&String::from_utf8_lossy(&passwd), user.unwrap_or("root")))
+}
+
+/// Find the home directory of a user spec (`name`, `uid`, optionally `:group`) in passwd text.
+fn passwd_home(passwd: &str, user: &str) -> Option<String> {
+    let user = user.split_once(':').map_or(user, |(user, _)| user);
+    let entries: Vec<Vec<&str>> = passwd
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .filter(|fields| fields.len() >= 7)
+        .collect();
+    entries
+        .iter()
+        .find(|fields| fields[0] == user)
+        .or_else(|| {
+            user.parse::<u32>()
+                .ok()
+                .and_then(|uid| entries.iter().find(|fields| fields[2].parse() == Ok(uid)))
+        })
+        .map(|fields| fields[5].to_string())
+        .filter(|home| home.starts_with('/'))
+}
+
 async fn sftp_read_handle(
     client: &Arc<AgentClient>,
     handle: crate::sandbox::fs::FsHandle,
@@ -4067,6 +4110,25 @@ mod tests {
             let user = fields.get("user").or_else(|| fields["options"].get("user"));
             assert_eq!(user, Some(&serde_json::json!("alice")), "{name}: {fields}");
         }
+    }
+
+    #[test]
+    fn passwd_home_resolves_names_uids_and_groups() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n\
+                      # comment\n\
+                      agent:x:1000:1000::/home/agent:/bin/bash\n\
+                      nohome:x:1001:1001::relative:/bin/sh\n";
+
+        assert_eq!(passwd_home(passwd, "root").as_deref(), Some("/root"));
+        assert_eq!(passwd_home(passwd, "agent").as_deref(), Some("/home/agent"));
+        assert_eq!(passwd_home(passwd, "1000").as_deref(), Some("/home/agent"));
+        assert_eq!(
+            passwd_home(passwd, "agent:wheel").as_deref(),
+            Some("/home/agent")
+        );
+        assert_eq!(passwd_home(passwd, "nohome"), None);
+        assert_eq!(passwd_home(passwd, "missing"), None);
+        assert_eq!(passwd_home(passwd, "4242"), None);
     }
 
     #[tokio::test]
