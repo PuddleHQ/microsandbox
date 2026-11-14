@@ -18,6 +18,7 @@
 #               root disk's ext4 (/.msb/rootfs/upperfs; the overlay at / cannot be trimmed) exits 0 and
 #               the root image (sandboxes/<name>/upper.ext4) drops back near its size after create
 # Prints "CASE <name>: PASS|FAIL ..." per case. Exit 0: all passed. 1: a case failed. 2: setup failed.
+# shellcheck disable=SC2016 # the guest probes keep $ unexpanded so the guest evaluates them
 set -uo pipefail
 
 rt=$(cd "${1:?runtime dir}" && pwd)
