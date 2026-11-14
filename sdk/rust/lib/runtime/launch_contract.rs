@@ -43,7 +43,10 @@ static CONTRACTS: LazyLock<Mutex<HashMap<PathBuf, CachedContract>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CAPABILITIES: LazyLock<Mutex<HashMap<PathBuf, CachedCapabilities>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound for the runtime's short version and capability queries. It only has to stop a
+/// hung executable from blocking a create or start forever. A busy host can take several
+/// seconds to schedule and page in the process, so it is generous.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_VERSION_OUTPUT: u64 = 4096;
 
 //--------------------------------------------------------------------------------------------------
@@ -1015,6 +1018,14 @@ async fn probe(path: &Path) -> MicrosandboxResult<Version> {
 }
 
 async fn bounded_probe(path: &Path, argument: &str) -> MicrosandboxResult<Vec<u8>> {
+    bounded_probe_within(path, argument, PROBE_TIMEOUT).await
+}
+
+async fn bounded_probe_within(
+    path: &Path,
+    argument: &str,
+    limit: Duration,
+) -> MicrosandboxResult<Vec<u8>> {
     let mut child = Command::new(path)
         .arg(argument)
         .stdin(Stdio::null())
@@ -1027,7 +1038,7 @@ async fn bounded_probe(path: &Path, argument: &str) -> MicrosandboxResult<Vec<u8
     })?;
     let mut output = output.take(MAX_VERSION_OUTPUT + 1);
     let mut bytes = Vec::new();
-    let outcome = tokio::time::timeout(PROBE_TIMEOUT, async {
+    let outcome = tokio::time::timeout(limit, async {
         output.read_to_end(&mut bytes).await?;
         if bytes.len() as u64 > MAX_VERSION_OUTPUT {
             return Err(std::io::Error::other(
@@ -1164,6 +1175,20 @@ mod tests {
             "printf '%s' '{\"protocols\":[2],\"protected_guest_state\":true}'",
         );
         require_protected_guest_state(&patched).await.unwrap();
+    }
+
+    /// A host at load average 20 to 40 can take several seconds to schedule and page in the
+    /// runtime for its short version query; that is slow, not broken.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_that_answers_after_a_few_seconds_on_a_busy_host_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let slow = script(
+            directory.path(),
+            "slow",
+            "sleep 3; printf '%s' 'msb 0.7.12'",
+        );
+        assert_eq!(probe(&slow).await.unwrap(), Version::new(0, 7, 12));
     }
 
     #[cfg(unix)]
@@ -1849,7 +1874,7 @@ mod tests {
         let path = script(dir.path(), "slow", "exec /bin/sleep 10");
         let start = std::time::Instant::now();
         assert!(
-            probe(&path)
+            bounded_probe_within(&path, "--version", Duration::from_millis(500))
                 .await
                 .unwrap_err()
                 .to_string()
