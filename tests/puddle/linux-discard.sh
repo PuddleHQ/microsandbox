@@ -75,7 +75,15 @@ g "head -c 536870912 /dev/urandom > /root-big && sync && rm /root-big && sync" \
   || { echo "setup: guest root write failed"; exit 2; }
 root_written=$(mib "$root_img")
 echo "root image after 512 MiB written and deleted: $root_written MiB allocated"
+# What decides the root-disk trim: the upper's block device, its queue limits, the mounts, the guest kernel (T-1597).
+diag() { g "$1" 2>&1 | sed "s/^/diag: /"; }
+echo "diag: host kernel $(uname -r), runner image ${ImageOS:-?} ${ImageVersion:-?}"
+diag 'echo "guest kernel $(uname -r)"; findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS'
+diag 'u=$(findmnt -no SOURCE /.msb/rootfs/upperfs); echo "upperfs source=$u"; d=${u#/dev/}; d=${d%%[0-9]*}; for x in "$d" $(ls /sys/block); do [ -d /sys/block/$x ] && echo "$x discard_max_bytes=$(cat /sys/block/$x/queue/discard_max_bytes) granularity=$(cat /sys/block/$x/queue/discard_granularity) rotational=$(cat /sys/block/$x/queue/rotational) size=$(cat /sys/block/$x/size)"; done'
 root_out=$(g "fstrim -v /.msb/rootfs/upperfs" 2>&1); root_rc=$?
+if [ "$root_rc" -ne 0 ]; then
+  diag 'u=$(findmnt -no SOURCE /.msb/rootfs/upperfs); d=${u#/dev/}; d=${d%%[0-9]*}; echo "after failed trim: $u $d discard_max_bytes=$(cat /sys/block/$d/queue/discard_max_bytes 2>&1)"; dmesg 2>&1 | grep -i -E "vd[a-z]|virtio|discard|ext4" | tail -30'
+fi
 echo "fstrim /.msb/rootfs/upperfs: rc=$root_rc: $root_out"
 g "sync"
 root_trimmed=$(mib "$root_img")
