@@ -23,7 +23,7 @@ cp target/release/msb "$out/msb-linux-x86_64"
 
 # The agentd inside msb is the one given, not a downloaded one.
 want=$(sha256sum "$agentd" | cut -d' ' -f1)
-staged=$(find target/release/build -path '*microsandbox-filesystem-*/out/agentd' -type f)
+staged=$(find target/release/build -path '*microsandbox-filesystem*/out/agentd' -type f)
 [ -n "$staged" ] || { echo "::error::no staged agentd under target/release/build"; exit 1; }
 for f in $staged; do
   got=$(sha256sum "$f" | cut -d' ' -f1)

@@ -425,7 +425,7 @@ jobs:
         run: |
           $want = (Get-FileHash agentd\agentd-x86_64 -Algorithm SHA256).Hash
           $staged = Get-ChildItem "target\$env:RUST_TARGET\release\build" -Recurse -File -Filter agentd |
-            Where-Object { $_.FullName -match 'microsandbox-filesystem-[0-9a-f]+\\out\\agentd$' }
+            Where-Object { $_.FullName -match 'microsandbox-filesystem[-\\][0-9a-f]+\\out\\agentd$' }
           if (-not $staged) { throw "no staged agentd found under target\$env:RUST_TARGET\release\build" }
           foreach ($f in $staged) {
             $got = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
