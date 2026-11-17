@@ -47,4 +47,6 @@ pick | fix(agentd): give every guest process a SIGTERM and a grace period at shu
 pick | fix(db): open the catalog's first connection outside the pool's connect timeout | - | -
 pick | fix(ssh): start SFTP sessions in the user's home directory | msb-ssh-sftp-home-and-read | -
 pick | fix(ssh): answer zero-length SFTP reads with empty data | msb-ssh-sftp-home-and-read | -
+pick | fix(sdk): give the runtime version probe 30 s instead of 2 s | msb-version-probe-timeout | -
+pick | fix(image): read and write tar archives with the maintained tar crate | - | -
 version | build: version the puddle fork as* | - | -
