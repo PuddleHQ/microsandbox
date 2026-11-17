@@ -1026,13 +1026,18 @@ async fn bounded_probe_within(
     argument: &str,
     limit: Duration,
 ) -> MicrosandboxResult<Vec<u8>> {
-    let mut child = Command::new(path)
+    let mut command = Command::new(path);
+    command
         .arg(argument)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    // A launcher without a console (a GUI program) would otherwise give msb a new console,
+    // whose window flashes on the desktop for every probe.
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    let mut child = command.spawn()?;
     let output = child.stdout.take().ok_or_else(|| {
         MicrosandboxError::Runtime("runtime version probe has no output pipe".into())
     })?;
