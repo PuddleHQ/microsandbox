@@ -5,16 +5,14 @@
 //! including whiteouts, hardlinks, special files, and path validation.
 
 use std::fmt;
-use std::future::poll_fn;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
-use futures::StreamExt;
 use sha2::{Digest as Sha2Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
-use tokio_tar as tar;
+use tokio_util::io::SyncIoBridge;
 
 use crate::tree::{
     DataSpool, DeviceNode, DirectoryNode, FileData, FileTree, FileTreeError, InodeMetadata,
@@ -39,10 +37,8 @@ const GZIP_MAGIC: [u8; 2] = [0x1F, 0x8B];
 /// Zstandard magic bytes.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// Entry cadence for cooperative scheduler yields during tar ingestion.
-const INGEST_YIELD_EVERY_ENTRIES: u64 = 32;
-
-/// Maximum file-body read size used while ingesting tar entries.
+/// Maximum file-body read size used while ingesting tar entries, and the
+/// read-ahead buffer between the tar parser and the async stream.
 const ENTRY_READ_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Compressed input buffer size used before gzip/zstd decoders.
@@ -187,12 +183,49 @@ impl From<FileTreeError> for IngestError {
 ///
 /// If `spool` is provided, files larger than `SPOOL_THRESHOLD` are written
 /// to the spool file instead of held in memory.
-pub async fn ingest_tar<R: AsyncRead + Unpin>(
+///
+/// The tar parser is synchronous, so the stream is parsed on the blocking
+/// pool and read through a [`SyncIoBridge`].
+pub async fn ingest_tar<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,
     limits: &ResourceLimits,
-    mut spool: Option<&mut DataSpool>,
+    spool: Option<DataSpool>,
 ) -> Result<FileTree, IngestError> {
-    let mut archive = tar::Archive::new(reader);
+    let (tree, _reader) = ingest_on_blocking_pool(reader, limits, spool).await?;
+    Ok(tree)
+}
+
+/// Parse `reader` on the blocking pool and hand the reader back, so callers
+/// can keep reading (and hashing) the bytes after the end-of-archive marker.
+async fn ingest_on_blocking_pool<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    limits: &ResourceLimits,
+    spool: Option<DataSpool>,
+) -> Result<(FileTree, R), IngestError> {
+    let limits = limits.clone();
+    let bridge = SyncIoBridge::new(reader);
+    let task = tokio::task::spawn_blocking(move || {
+        // Bytes left in the read-ahead buffer were already pulled through
+        // `reader`, so dropping the buffer loses nothing a hashing reader saw.
+        let mut archive = tar::Archive::new(std::io::BufReader::with_capacity(
+            ENTRY_READ_CHUNK_SIZE,
+            bridge,
+        ));
+        let tree = ingest_archive(&mut archive, &limits, spool)?;
+        Ok((tree, archive.into_inner().into_inner().into_inner()))
+    });
+    match task.await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(IngestError::Io(std::io::Error::other(error))),
+    }
+}
+
+fn ingest_archive<R: Read>(
+    archive: &mut tar::Archive<R>,
+    limits: &ResourceLimits,
+    mut spool: Option<DataSpool>,
+) -> Result<FileTree, IngestError> {
     let mut tree = FileTree::new();
     let mut entry_count: u64 = 0;
     let mut total_size: u64 = 0;
@@ -200,9 +233,9 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
     let mut spool_read_buf = Vec::new();
     let mut spool_write_buf = Vec::new();
 
-    let mut entries = archive.entries().map_err(IngestError::Io)?;
+    let entries = archive.entries().map_err(IngestError::Io)?;
 
-    while let Some(entry_result) = entries.next().await {
+    for entry_result in entries {
         let mut entry = entry_result.map_err(IngestError::Io)?;
 
         entry_count += 1;
@@ -213,7 +246,7 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
         let header = entry.header().clone();
 
         // Get the raw path bytes. Entry::path_bytes handles PAX extended headers.
-        let raw_path = entry.path_bytes().map_err(IngestError::Io)?;
+        let raw_path = entry.path_bytes();
         let path = normalize_path(&raw_path, limits)?;
 
         // Skip empty paths (root directory entry `./` after stripping).
@@ -230,12 +263,9 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
         match entry_type {
             tar::EntryType::Link => {
                 // Hardlink — look up the target in the tree and clone its data.
-                let link_target_bytes = entry
-                    .link_name_bytes()
-                    .map_err(IngestError::Io)?
-                    .ok_or_else(|| {
-                        IngestError::InvalidEntry("hardlink with no target".to_string())
-                    })?;
+                let link_target_bytes = entry.link_name_bytes().ok_or_else(|| {
+                    IngestError::InvalidEntry("hardlink with no target".to_string())
+                })?;
                 let target_path = normalize_path(&link_target_bytes, limits)?;
                 let target_path = match target_path {
                     Some(p) => p,
@@ -258,12 +288,9 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
                 tree.insert(&path, node)?;
             }
             tar::EntryType::Symlink => {
-                let link_target = entry
-                    .link_name_bytes()
-                    .map_err(IngestError::Io)?
-                    .ok_or_else(|| {
-                        IngestError::InvalidEntry("symlink with no target".to_string())
-                    })?;
+                let link_target = entry.link_name_bytes().ok_or_else(|| {
+                    IngestError::InvalidEntry("symlink with no target".to_string())
+                })?;
 
                 if link_target.len() > limits.max_symlink_target {
                     return Err(IngestError::SymlinkTargetTooLong(
@@ -297,9 +324,10 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
                     }
                 }
             }
-            tar::EntryType::Regular | tar::EntryType::Continuous => {
-                // Read file data.
-                let size = header.size().map_err(IngestError::Io)?;
+            tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse => {
+                // The entry size honours a PAX `size` record and, for GNU
+                // sparse members, is the expanded size the reader yields.
+                let size = entry.size();
                 if size > limits.max_file_size {
                     return Err(IngestError::FileTooLarge(
                         String::from_utf8_lossy(&path).into_owned(),
@@ -336,10 +364,9 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
                                 spool,
                                 &mut spool_read_buf,
                                 &mut spool_write_buf,
-                            )
-                            .await?
+                            )?
                         } else {
-                            FileData::Memory(read_entry_to_memory(&mut entry, size).await?)
+                            FileData::Memory(read_entry_to_memory(&mut entry, size)?)
                         };
 
                         let node = TreeNode::RegularFile(RegularFileNode {
@@ -379,7 +406,7 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
             }
             // GNU extensions and PAX headers are handled internally by the tar library.
             // Socket type is not a standard tar entry type but we handle it if encountered.
-            tar::EntryType::Other(0o140) => {
+            other if other.as_byte() == 0o140 => {
                 // Unix socket (type '`' = 0o140 = 96).
                 let node = TreeNode::Socket(metadata);
                 tree.insert(&path, node)?;
@@ -389,10 +416,6 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
                 // These are handled internally by the tar library when reading
                 // subsequent entries.
             }
-        }
-
-        if entry_count.is_multiple_of(INGEST_YIELD_EVERY_ENTRIES) {
-            tokio::task::yield_now().await;
         }
     }
 
@@ -413,56 +436,50 @@ pub struct IngestResult {
     pub uncompressed_digest: String,
 }
 
-pub async fn ingest_compressed_tar<R: AsyncRead + Unpin>(
+pub async fn ingest_compressed_tar<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,
     compression: Compression,
     limits: &ResourceLimits,
     spool_path: Option<&std::path::Path>,
 ) -> Result<IngestResult, IngestError> {
-    let mut spool = spool_path
+    let spool = spool_path
         .map(DataSpool::new)
         .transpose()
         .map_err(IngestError::Io)?;
 
     match compression {
-        Compression::None => {
-            let mut hashing = HashingReader::new(reader);
-            let tree = ingest_tar(&mut hashing, limits, spool.as_mut()).await?;
-            drain_reader(&mut hashing).await?;
-            Ok(IngestResult {
-                tree,
-                uncompressed_digest: hashing.hex_digest(),
-            })
-        }
+        Compression::None => ingest_hashed(reader, limits, spool).await,
         Compression::Gzip => {
             let decoder = GzipDecoder::new(BufReader::with_capacity(
                 COMPRESSED_INPUT_BUFFER_SIZE,
                 reader,
             ));
-            let mut hashing = HashingReader::new(decoder);
-            let tree = ingest_tar(&mut hashing, limits, spool.as_mut()).await?;
-            // Drain any remaining bytes (tar EOF padding) to include
-            // them in the hash — diff_id covers the full decompressed stream.
-            drain_reader(&mut hashing).await?;
-            Ok(IngestResult {
-                tree,
-                uncompressed_digest: hashing.hex_digest(),
-            })
+            ingest_hashed(decoder, limits, spool).await
         }
         Compression::Zstd => {
             let decoder = ZstdDecoder::new(BufReader::with_capacity(
                 COMPRESSED_INPUT_BUFFER_SIZE,
                 reader,
             ));
-            let mut hashing = HashingReader::new(decoder);
-            let tree = ingest_tar(&mut hashing, limits, spool.as_mut()).await?;
-            drain_reader(&mut hashing).await?;
-            Ok(IngestResult {
-                tree,
-                uncompressed_digest: hashing.hex_digest(),
-            })
+            ingest_hashed(decoder, limits, spool).await
         }
     }
+}
+
+/// Ingest a decompressed stream and hash all of it, including the bytes
+/// after the end-of-archive marker: the diff_id covers the full stream.
+async fn ingest_hashed<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    limits: &ResourceLimits,
+    spool: Option<DataSpool>,
+) -> Result<IngestResult, IngestError> {
+    let (tree, mut hashing) =
+        ingest_on_blocking_pool(HashingReader::new(reader), limits, spool).await?;
+    drain_reader(&mut hashing).await?;
+    Ok(IngestResult {
+        tree,
+        uncompressed_digest: hashing.hex_digest(),
+    })
 }
 
 /// Read all remaining bytes from a reader to ensure the full stream is
@@ -743,46 +760,26 @@ fn handle_hardlink(
     Ok(())
 }
 
-async fn read_entry_to_memory<R: AsyncRead + Unpin>(
-    entry: &mut tar::Entry<R>,
-    size: u64,
-) -> Result<Vec<u8>, IngestError> {
-    let size = usize::try_from(size)
-        .map_err(|_| IngestError::InvalidEntry("file too large to fit in memory".to_string()))?;
-    let mut data = Vec::with_capacity(size);
-    let mut remaining = size;
-
-    while remaining > 0 {
-        let start = data.len();
-        let to_read = remaining.min(ENTRY_READ_CHUNK_SIZE);
-        let read = {
-            let mut read_buf = ReadBuf::uninit(&mut data.spare_capacity_mut()[..to_read]);
-            poll_fn(|cx| Pin::new(&mut *entry).poll_read(cx, &mut read_buf))
-                .await
-                .map_err(IngestError::Io)?;
-            read_buf.filled().len()
-        };
-
-        if read == 0 {
-            return Err(IngestError::Io(std::io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "failed to fill whole buffer",
-            )));
-        }
-
-        // SAFETY: `poll_read` reported `read` initialized bytes in the spare
-        // capacity window above, and the window begins at the previous length.
-        unsafe {
-            data.set_len(start + read);
-        }
-        remaining -= read;
+/// Read an entry body into memory. The buffer grows with the bytes that
+/// arrive; it is never sized from the declared size, which a hostile header
+/// can set to anything.
+fn read_entry_to_memory(entry: &mut impl Read, size: u64) -> Result<Vec<u8>, IngestError> {
+    let mut data = Vec::new();
+    entry
+        .take(size)
+        .read_to_end(&mut data)
+        .map_err(IngestError::Io)?;
+    if data.len() as u64 != size {
+        return Err(IngestError::Io(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        )));
     }
-
     Ok(data)
 }
 
-async fn stream_entry_to_spool<R: AsyncRead + Unpin>(
-    entry: &mut tar::Entry<R>,
+fn stream_entry_to_spool(
+    entry: &mut impl Read,
     size: u64,
     spool: &mut DataSpool,
     read_buf: &mut Vec<u8>,
@@ -803,7 +800,6 @@ async fn stream_entry_to_spool<R: AsyncRead + Unpin>(
         let to_read = remaining.min(read_buf.len() as u64) as usize;
         entry
             .read_exact(&mut read_buf[..to_read])
-            .await
             .map_err(IngestError::Io)?;
 
         if write_buf.len() + to_read > SPOOL_WRITE_BUFFER_SIZE && !write_buf.is_empty() {
@@ -1050,9 +1046,6 @@ mod tests {
 
     // ---- Integration tests using the sync `tar` crate to build test archives ----
 
-    // Use the sync `tar` crate (dev-dependency) for building test tarballs.
-    // The parent module aliases `tokio_tar` as `tar`, so we use the explicit
-    // crate path here to avoid ambiguity.
     use ::tar as sync_tar;
     use async_compression::tokio::write::GzipEncoder;
     use tempfile::tempdir;
@@ -1150,9 +1143,9 @@ mod tests {
 
         let tempdir = tempdir().unwrap();
         let spool_path = tempdir.path().join("layer.spool");
-        let mut spool = DataSpool::new(&spool_path).unwrap();
+        let spool = DataSpool::new(&spool_path).unwrap();
         let limits = ResourceLimits::default();
-        let tree = ingest_tar(std::io::Cursor::new(data), &limits, Some(&mut spool))
+        let tree = ingest_tar(std::io::Cursor::new(data), &limits, Some(spool))
             .await
             .unwrap();
 
@@ -1186,9 +1179,9 @@ mod tests {
 
         let tempdir = tempdir().unwrap();
         let spool_path = tempdir.path().join("layer.spool");
-        let mut spool = DataSpool::new(&spool_path).unwrap();
+        let spool = DataSpool::new(&spool_path).unwrap();
         let limits = ResourceLimits::default();
-        let tree = ingest_tar(std::io::Cursor::new(data), &limits, Some(&mut spool))
+        let tree = ingest_tar(std::io::Cursor::new(data), &limits, Some(spool))
             .await
             .unwrap();
 
@@ -1604,5 +1597,549 @@ mod tests {
         // Only the file should exist.
         assert_eq!(tree.node_count(), 1);
         assert!(tree.get(b"file.txt").is_some());
+    }
+
+    // ---- Hostile layers ----
+    //
+    // Layers come from registries we do not control. These archives are built
+    // record by record so the paths, sizes and link names are exactly what an
+    // attacker would write, without the builder's own validation.
+
+    /// A GNU header with raw `name` and `linkname` bytes and the given size.
+    fn raw_header(
+        kind: sync_tar::EntryType,
+        name: &[u8],
+        link: Option<&[u8]>,
+        size: u64,
+    ) -> sync_tar::Header {
+        let mut header = sync_tar::Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_mode(0o644);
+        header.set_size(size);
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.name[..name.len()].copy_from_slice(name);
+        if let Some(link) = link {
+            gnu.linkname[..link.len()].copy_from_slice(link);
+        }
+        header.set_cksum();
+        header
+    }
+
+    fn raw_entry(
+        b: &mut sync_tar::Builder<Vec<u8>>,
+        kind: sync_tar::EntryType,
+        name: &[u8],
+        link: Option<&[u8]>,
+        data: &[u8],
+    ) {
+        let header = raw_header(kind, name, link, data.len() as u64);
+        b.append(&header, data).unwrap();
+    }
+
+    fn raw_file(b: &mut sync_tar::Builder<Vec<u8>>, name: &[u8], data: &[u8]) {
+        raw_entry(b, sync_tar::EntryType::Regular, name, None, data);
+    }
+
+    /// A PAX extended header (`x`) carrying `records` for the next member.
+    fn pax_header(b: &mut sync_tar::Builder<Vec<u8>>, records: &[(&str, &[u8])]) {
+        let mut data = Vec::new();
+        for (key, value) in records {
+            let body = 1 + key.len() + 1 + value.len() + 1;
+            let mut len = body + 1;
+            while format!("{len}").len() + body != len {
+                len += 1;
+            }
+            data.extend_from_slice(format!("{len} {key}=").as_bytes());
+            data.extend_from_slice(value);
+            data.push(b'\n');
+        }
+        raw_entry(
+            b,
+            sync_tar::EntryType::XHeader,
+            b"PaxHeaders/x",
+            None,
+            &data,
+        );
+    }
+
+    /// A GNU long-name (`L`) record naming the next member.
+    fn gnu_long_name(b: &mut sync_tar::Builder<Vec<u8>>, name: &[u8]) {
+        let mut data = name.to_vec();
+        data.push(0);
+        raw_entry(
+            b,
+            sync_tar::EntryType::GNULongName,
+            b"././@LongLink",
+            None,
+            &data,
+        );
+    }
+
+    async fn ingest(data: Vec<u8>) -> Result<FileTree, IngestError> {
+        ingest_tar(std::io::Cursor::new(data), &ResourceLimits::default(), None).await
+    }
+
+    fn file_bytes(tree: &FileTree, path: &[u8]) -> Vec<u8> {
+        match tree.get(path) {
+            Some(TreeNode::RegularFile(f)) => f.data.read_all().unwrap(),
+            _ => panic!("expected regular file at {}", String::from_utf8_lossy(path)),
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_dotdot_file_is_refused() {
+        let data = build_tar(|b| raw_file(b, b"../x", b"escape"));
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_dotdot_inside_path_is_refused() {
+        let data = build_tar(|b| raw_file(b, b"a/b/../../../etc/passwd", b"escape"));
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_dot_slash_dotdot_is_refused() {
+        let data = build_tar(|b| raw_file(b, b"./../x", b"escape"));
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_dotdot_directory_is_refused() {
+        let data = build_tar(|b| raw_entry(b, sync_tar::EntryType::Directory, b"../d/", None, b""));
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_dotdot_symlink_is_refused() {
+        let data = build_tar(|b| {
+            raw_entry(
+                b,
+                sync_tar::EntryType::Symlink,
+                b"../link",
+                Some(b"/etc/passwd"),
+                b"",
+            )
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_dotdot_whiteout_is_refused() {
+        let data = build_tar(|b| raw_file(b, b"../.wh.victim", b""));
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_dotdot_hardlink_target_is_refused() {
+        let data = build_tar(|b| {
+            raw_file(b, b"a", b"data");
+            raw_entry(
+                b,
+                sync_tar::EntryType::Link,
+                b"b",
+                Some(b"../etc/shadow"),
+                b"",
+            );
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_dotdot_in_gnu_long_name_is_refused() {
+        let name = format!("{}/../../../../etc/cron.d/x", "a".repeat(120));
+        let data = build_tar(|b| {
+            gnu_long_name(b, name.as_bytes());
+            raw_file(b, b"innocent", b"escape");
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_dotdot_in_pax_path_is_refused() {
+        let data = build_tar(|b| {
+            pax_header(b, &[("path", b"../../etc/x")]);
+            raw_file(b, b"innocent", b"escape");
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::PathTraversal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_absolute_paths_stay_inside_the_layer() {
+        let data = build_tar(|b| {
+            raw_file(b, b"/etc/shadow", b"one");
+            raw_file(b, b"//root/.ssh/authorized_keys", b"two");
+        });
+        let tree = ingest(data).await.unwrap();
+        assert_eq!(file_bytes(&tree, b"etc/shadow"), b"one");
+        assert_eq!(file_bytes(&tree, b"root/.ssh/authorized_keys"), b"two");
+        assert_eq!(tree.node_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn hostile_symlink_target_is_stored_not_followed() {
+        let data = build_tar(|b| {
+            raw_entry(
+                b,
+                sync_tar::EntryType::Symlink,
+                b"passwd",
+                Some(b"../../../../etc/passwd"),
+                b"",
+            )
+        });
+        let tree = ingest(data).await.unwrap();
+        match tree.get(b"passwd") {
+            Some(TreeNode::Symlink(link)) => assert_eq!(link.target, b"../../../../etc/passwd"),
+            _ => panic!("expected symlink"),
+        }
+        assert_eq!(tree.node_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn hostile_write_through_symlink_is_refused() {
+        let data = build_tar(|b| {
+            raw_entry(b, sync_tar::EntryType::Symlink, b"etc", Some(b"/etc"), b"");
+            raw_file(b, b"etc/passwd", b"root::0:0::/:/bin/sh");
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::Tree(FileTreeError::NotADirectory(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_directory_below_symlink_is_refused() {
+        let data = build_tar(|b| {
+            raw_entry(b, sync_tar::EntryType::Symlink, b"up", Some(b"../.."), b"");
+            raw_entry(b, sync_tar::EntryType::Directory, b"up/sub/", None, b"");
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::Tree(FileTreeError::NotADirectory(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_symlink_over_populated_directory_is_refused() {
+        let data = build_tar(|b| {
+            raw_file(b, b"dir/file", b"data");
+            raw_entry(b, sync_tar::EntryType::Symlink, b"dir", Some(b"/etc"), b"");
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::Tree(FileTreeError::EntryExists(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_hardlink_to_host_file_is_refused() {
+        let data = build_tar(|b| {
+            raw_entry(
+                b,
+                sync_tar::EntryType::Link,
+                b"shadow",
+                Some(b"/etc/shadow"),
+                b"",
+            )
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::HardlinkTarget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_hardlink_to_symlink_is_refused() {
+        let data = build_tar(|b| {
+            raw_entry(
+                b,
+                sync_tar::EntryType::Symlink,
+                b"link",
+                Some(b"/etc/shadow"),
+                b"",
+            );
+            raw_entry(b, sync_tar::EntryType::Link, b"hard", Some(b"link"), b"");
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::HardlinkTarget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_hardlink_to_directory_is_refused() {
+        let data = build_tar(|b| {
+            raw_entry(b, sync_tar::EntryType::Directory, b"dir/", None, b"");
+            raw_entry(b, sync_tar::EntryType::Link, b"hard", Some(b"dir"), b"");
+        });
+        assert!(matches!(
+            ingest(data).await,
+            Err(IngestError::HardlinkTarget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostile_pax_size_larger_than_ustar_size_is_honoured() {
+        // The ustar field says 0; a reader that trusts it would parse the body
+        // as the next header.
+        let data = build_tar(|b| {
+            pax_header(b, &[("size", b"5")]);
+            let header = raw_header(sync_tar::EntryType::Regular, b"smuggled", None, 0);
+            b.get_mut().extend_from_slice(header.as_bytes());
+            b.get_mut().extend_from_slice(b"hello");
+            b.get_mut().extend_from_slice(&[0; 507]);
+            raw_file(b, b"next", b"after");
+        });
+        let tree = ingest(data).await.unwrap();
+        assert_eq!(file_bytes(&tree, b"smuggled"), b"hello");
+        assert_eq!(file_bytes(&tree, b"next"), b"after");
+    }
+
+    #[tokio::test]
+    async fn hostile_pax_size_smaller_than_ustar_size_is_honoured() {
+        // The ustar field claims 1024 bytes, which would swallow the next member.
+        let data = build_tar(|b| {
+            pax_header(b, &[("size", b"3")]);
+            let header = raw_header(sync_tar::EntryType::Regular, b"short", None, 1024);
+            b.get_mut().extend_from_slice(header.as_bytes());
+            b.get_mut().extend_from_slice(b"abc");
+            b.get_mut().extend_from_slice(&[0; 509]);
+            raw_file(b, b"next", b"after");
+        });
+        let tree = ingest(data).await.unwrap();
+        assert_eq!(file_bytes(&tree, b"short"), b"abc");
+        assert_eq!(file_bytes(&tree, b"next"), b"after");
+    }
+
+    #[tokio::test]
+    async fn hostile_pax_size_counts_against_the_file_limit() {
+        let data = build_tar(|b| {
+            pax_header(b, &[("size", b"4096")]);
+            let header = raw_header(sync_tar::EntryType::Regular, b"big", None, 0);
+            b.get_mut().extend_from_slice(header.as_bytes());
+            b.get_mut().extend_from_slice(&[0; 4096]);
+        });
+        let limits = ResourceLimits {
+            max_file_size: 1024,
+            ..ResourceLimits::default()
+        };
+        let result = ingest_tar(std::io::Cursor::new(data), &limits, None).await;
+        assert!(matches!(result, Err(IngestError::FileTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn hostile_huge_declared_size_is_not_reserved_up_front() {
+        // 1 EiB declared, 5 bytes present. Reserving the declared size would
+        // abort the process before the short read is noticed.
+        let data = build_tar(|b| {
+            let header = raw_header(sync_tar::EntryType::Regular, b"huge", None, 1 << 60);
+            b.get_mut().extend_from_slice(header.as_bytes());
+            b.get_mut().extend_from_slice(b"hello");
+        });
+        let limits = ResourceLimits {
+            max_file_size: u64::MAX,
+            max_total_size: u64::MAX,
+            ..ResourceLimits::default()
+        };
+        let result = ingest_tar(std::io::Cursor::new(data), &limits, None).await;
+        assert!(matches!(result, Err(IngestError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof));
+    }
+
+    #[tokio::test]
+    async fn hostile_huge_declared_size_with_spool_fails_cleanly() {
+        let data = build_tar(|b| {
+            let header = raw_header(sync_tar::EntryType::Regular, b"huge", None, 1 << 60);
+            b.get_mut().extend_from_slice(header.as_bytes());
+            b.get_mut().extend_from_slice(&[1; 4096]);
+        });
+        let limits = ResourceLimits {
+            max_file_size: u64::MAX,
+            max_total_size: u64::MAX,
+            ..ResourceLimits::default()
+        };
+        let tempdir = tempdir().unwrap();
+        let spool = DataSpool::new(&tempdir.path().join("layer.spool")).unwrap();
+        let result = ingest_tar(std::io::Cursor::new(data), &limits, Some(spool)).await;
+        assert!(matches!(result, Err(IngestError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof));
+    }
+
+    #[tokio::test]
+    async fn hostile_total_size_is_checked_before_reading() {
+        let data = build_tar(|b| {
+            raw_file(b, b"a", &[1; 600]);
+            raw_file(b, b"b", &[2; 600]);
+        });
+        let limits = ResourceLimits {
+            max_total_size: 1000,
+            ..ResourceLimits::default()
+        };
+        let result = ingest_tar(std::io::Cursor::new(data), &limits, None).await;
+        assert!(matches!(result, Err(IngestError::TotalSizeExceeded)));
+    }
+
+    #[tokio::test]
+    async fn hostile_truncated_body_is_an_error() {
+        let mut data = build_tar(|b| raw_file(b, b"file", &[7; 2048]));
+        data.truncate(512 + 1000);
+        assert!(matches!(ingest(data).await, Err(IngestError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn hostile_symlink_target_over_limit_is_refused() {
+        let target = "t/".repeat(40);
+        let data = build_tar(|b| {
+            let mut header = sync_tar::Header::new_gnu();
+            header.set_entry_type(sync_tar::EntryType::Symlink);
+            header.set_size(0);
+            b.append_link(&mut header, "link", &target).unwrap();
+        });
+        let limits = ResourceLimits {
+            max_symlink_target: 16,
+            ..ResourceLimits::default()
+        };
+        let result = ingest_tar(std::io::Cursor::new(data), &limits, None).await;
+        assert!(matches!(result, Err(IngestError::SymlinkTargetTooLong(_))));
+    }
+
+    #[tokio::test]
+    async fn hostile_device_nodes_keep_major_and_minor() {
+        let data = build_tar(|b| {
+            for (kind, name, major, minor) in [
+                (sync_tar::EntryType::Char, "dev/null", 1, 3),
+                (sync_tar::EntryType::Block, "dev/sda1", 8, 1),
+                (sync_tar::EntryType::Char, "dev/big", 4095, 1_048_575),
+            ] {
+                let mut header = sync_tar::Header::new_gnu();
+                header.set_path(name).unwrap();
+                header.set_entry_type(kind);
+                header.set_size(0);
+                header.set_device_major(major).unwrap();
+                header.set_device_minor(minor).unwrap();
+                header.set_cksum();
+                b.append(&header, &[] as &[u8]).unwrap();
+            }
+        });
+        let tree = ingest(data).await.unwrap();
+        match tree.get(b"dev/null") {
+            Some(TreeNode::CharDevice(dev)) => assert_eq!((dev.major, dev.minor), (1, 3)),
+            _ => panic!("expected char device"),
+        }
+        match tree.get(b"dev/sda1") {
+            Some(TreeNode::BlockDevice(dev)) => assert_eq!((dev.major, dev.minor), (8, 1)),
+            _ => panic!("expected block device"),
+        }
+        match tree.get(b"dev/big") {
+            Some(TreeNode::CharDevice(dev)) => {
+                assert_eq!((dev.major, dev.minor), (4095, 1_048_575))
+            }
+            _ => panic!("expected char device"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_gnu_long_names_and_link_targets_are_read() {
+        let long_dir = "d".repeat(90);
+        let long_path = format!("{long_dir}/{}", "f".repeat(90));
+        let long_target = format!("/opt/{}", "t".repeat(150));
+        let data = build_tar(|b| {
+            let mut header = sync_tar::Header::new_gnu();
+            header.set_entry_type(sync_tar::EntryType::Regular);
+            header.set_size(4);
+            b.append_data(&mut header, &long_path, &b"long"[..])
+                .unwrap();
+
+            let mut header = sync_tar::Header::new_gnu();
+            header.set_entry_type(sync_tar::EntryType::Symlink);
+            header.set_size(0);
+            b.append_link(&mut header, "link", &long_target).unwrap();
+
+            let mut header = sync_tar::Header::new_gnu();
+            header.set_entry_type(sync_tar::EntryType::Link);
+            header.set_size(0);
+            b.append_link(&mut header, "hard", &long_path).unwrap();
+        });
+        let tree = ingest(data).await.unwrap();
+        assert_eq!(file_bytes(&tree, long_path.as_bytes()), b"long");
+        assert_eq!(file_bytes(&tree, b"hard"), b"long");
+        match tree.get(b"link") {
+            Some(TreeNode::Symlink(link)) => assert_eq!(link.target, long_target.as_bytes()),
+            _ => panic!("expected symlink"),
+        }
+    }
+
+    /// An old-GNU sparse member (`S`) of `real_size` bytes with one data run.
+    fn gnu_sparse(
+        b: &mut sync_tar::Builder<Vec<u8>>,
+        name: &str,
+        real_size: u64,
+        offset: u64,
+        run: &[u8],
+    ) {
+        fn octal(field: &mut [u8; 12], value: u64) {
+            field.copy_from_slice(format!("{value:011o}\0").as_bytes());
+        }
+        let mut header = sync_tar::Header::new_gnu();
+        header.set_path(name).unwrap();
+        header.set_entry_type(sync_tar::EntryType::GNUSparse);
+        header.set_mode(0o644);
+        header.set_size(run.len() as u64);
+        let gnu = header.as_gnu_mut().unwrap();
+        octal(&mut gnu.realsize, real_size);
+        octal(&mut gnu.sparse[0].offset, offset);
+        octal(&mut gnu.sparse[0].numbytes, run.len() as u64);
+        // GNU tar ends the map with an empty run at the real size.
+        octal(&mut gnu.sparse[1].offset, real_size);
+        octal(&mut gnu.sparse[1].numbytes, 0);
+        header.set_cksum();
+        b.append(&header, run).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hostile_gnu_sparse_member_is_expanded() {
+        let data = build_tar(|b| gnu_sparse(b, "sparse.img", 10_000, 4096, b"data"));
+        let tree = ingest(data).await.unwrap();
+        let mut expected = vec![0u8; 10_000];
+        expected[4096..4100].copy_from_slice(b"data");
+        assert_eq!(file_bytes(&tree, b"sparse.img"), expected);
+    }
+
+    #[tokio::test]
+    async fn hostile_gnu_sparse_real_size_counts_against_the_file_limit() {
+        // One archived byte claiming an 8 GiB file: the expanded size is what
+        // lands in the tree, so it is what the limit applies to.
+        let data = build_tar(|b| gnu_sparse(b, "bomb.img", (1 << 33) - 1, 0, b"x"));
+        let limits = ResourceLimits {
+            max_file_size: 1 << 20,
+            ..ResourceLimits::default()
+        };
+        let result = ingest_tar(std::io::Cursor::new(data), &limits, None).await;
+        assert!(matches!(result, Err(IngestError::FileTooLarge(_))));
     }
 }

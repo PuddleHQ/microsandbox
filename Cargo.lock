@@ -427,22 +427,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "astral-tokio-tar"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b18457efd137254e016bbde5e1d88df61c4e1a5ae2223746e56123bac6af2463"
-dependencies = [
- "futures-core",
- "libc",
- "portable-atomic",
- "rustc-hash",
- "rustix",
- "tokio",
- "tokio-stream",
- "xattr",
-]
-
-[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3796,7 +3780,6 @@ name = "microsandbox"
 version = "0.7.12-puddle.4"
 dependencies = [
  "anyhow",
- "astral-tokio-tar",
  "async-compression",
  "base64 0.23.1",
  "blake3",
@@ -4021,7 +4004,6 @@ dependencies = [
 name = "microsandbox-image"
 version = "0.7.12-puddle.4"
 dependencies = [
- "astral-tokio-tar",
  "async-compression",
  "blake3",
  "bytes",
@@ -4052,6 +4034,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tracing",
  "windows-sys 0.61.2",
 ]

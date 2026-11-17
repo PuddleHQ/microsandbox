@@ -90,6 +90,7 @@ pub struct DataSpool {
     offset: u64,
 }
 
+#[derive(Clone)]
 pub struct ResourceLimits {
     pub max_total_size: u64,
     pub max_file_size: u64,
