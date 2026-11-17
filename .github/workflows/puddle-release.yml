@@ -8,7 +8,8 @@
 # built here (firmware-windows, build-windows) from the tag's vendor/libkrunfw with the kernel
 # config of the Linux firmware (config-libkrunfw_x86_64), as upstream did up to v0.7.8: upstream's
 # Windows kernel config (config-libkrunfw-windows_x86_64, used since v0.7.12) has no netfilter, so
-# iptables, nft and dockerd fail in the guest. agentd is built here
+# iptables, nft and dockerd fail in the guest. vendor/libkrunfw points at PuddleHQ/libkrunfw (branch
+# `puddle`), upstream's libkrunfw with /dev/mem left out of every kernel config. agentd is built here
 # (musl, x86_64) from the same source as msb, because the fork changes code that runs in the guest
 # (the per-client forward limit) and the host and guest must agree on it.
 #
@@ -291,6 +292,16 @@ jobs:
           done
           echo "netfilter options built in: $cfg"
           sha256sum kernel.c
+
+      # vendor/libkrunfw is PuddleHQ/libkrunfw, whose kernel configs leave out /dev/mem: guest root
+      # must not map the virtio-mmio windows of the host's devices through it.
+      - name: Kernel config has no /dev/mem
+        working-directory: vendor/libkrunfw
+        run: |
+          set -euo pipefail
+          cfg=$(ls -d linux-*/.config)
+          grep -qx '# CONFIG_DEVMEM is not set' "$cfg" || { echo "::error::CONFIG_DEVMEM is not off in $cfg"; exit 1; }
+          echo "/dev/mem left out: $cfg"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

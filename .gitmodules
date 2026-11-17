@@ -1,7 +1,7 @@
 [submodule "vendor/libkrunfw"]
 	path = vendor/libkrunfw
-	url = https://github.com/superradcompany/libkrunfw.git
-	branch = krunfw
+	url = https://github.com/PuddleHQ/libkrunfw.git
+	branch = puddle
 [submodule "examples/root-bind/rootfs-alpine"]
 	path = examples/rust/root-bind/rootfs-alpine
 	url = https://github.com/superradcompany/rootfs-alpine
