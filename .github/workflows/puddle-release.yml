@@ -920,4 +920,4 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
           UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: bash _puddle/.github/puddle/publish-release.sh "$TAG" "$UPSTREAM_REPO" "$UPSTREAM_TAG" "$RUN_URL" assets upstream
+        run: bash _puddle/.github/puddle/publish-release.sh "$TAG" "$UPSTREAM_REPO" "$UPSTREAM_TAG" "$RUN_URL" assets upstream "_puddle/.github/puddle/release-notes/$TAG.md"

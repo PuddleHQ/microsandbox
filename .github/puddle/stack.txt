@@ -52,4 +52,5 @@ pick | fix(image): read and write tar archives with the maintained tar crate | -
 pick | fix(agentd): set USER and LOGNAME for exec next to HOME | - | -
 pick | fix(sdk): probe msb without a console window on Windows | - | -
 pick | feat(sdk): a buffered exec can cap the output it keeps | - | -
+pick | fix(agentd): never refuse a bulk purge, so a client disconnect cannot stop the VM | - | -
 version | build: version the puddle fork as* | - | -
