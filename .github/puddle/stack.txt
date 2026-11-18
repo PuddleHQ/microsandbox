@@ -49,4 +49,7 @@ pick | fix(ssh): start SFTP sessions in the user's home directory | msb-ssh-sftp
 pick | fix(ssh): answer zero-length SFTP reads with empty data | msb-ssh-sftp-home-and-read | -
 pick | fix(sdk): give the runtime version probe 30 s instead of 2 s | msb-version-probe-timeout | -
 pick | fix(image): read and write tar archives with the maintained tar crate | - | -
+pick | fix(agentd): set USER and LOGNAME for exec next to HOME | - | -
+pick | fix(sdk): probe msb without a console window on Windows | - | -
+pick | feat(sdk): a buffered exec can cap the output it keeps | - | -
 version | build: version the puddle fork as* | - | -
