@@ -52,9 +52,6 @@ const SESSION_OUTPUT_ITEM_CAPACITY: usize = 1024;
 /// Maximum number of records waiting for the independently scheduled bulk writer.
 const SESSION_BULK_OUTPUT_ITEM_CAPACITY: usize = 256;
 
-/// Maximum lifecycle commands waiting for the dedicated bulk scheduler.
-const SESSION_BULK_COMMAND_CAPACITY: usize = 128;
-
 //--------------------------------------------------------------------------------------------------
 // Functions: classify
 //--------------------------------------------------------------------------------------------------
@@ -274,7 +271,11 @@ pub struct SessionOutputSender {
     generation: u64,
     control_tx: mpsc::Sender<SessionOutputEnvelope>,
     bulk_tx: Option<mpsc::Sender<SessionOutputEnvelope>>,
-    bulk_command_tx: Option<mpsc::Sender<BulkOutputCommand>>,
+    /// Unbounded: a purge is queued from the synchronous agent loop, which can cancel every flow
+    /// of a disconnected client (hundreds) before the scheduler task runs once. A bounded queue
+    /// then refused the purge as if the scheduler were gone, and the agent loop exited. Commands
+    /// are bounded by the live flows plus one awaited park, resume or restore at a time.
+    bulk_command_tx: Option<mpsc::UnboundedSender<BulkOutputCommand>>,
     control_budget: Arc<Semaphore>,
     bulk_budget: Arc<Semaphore>,
     incarnation: Option<ClientIncarnation>,
@@ -444,11 +445,11 @@ impl SessionOutputSender {
         Self,
         mpsc::Receiver<SessionOutputEnvelope>,
         mpsc::Receiver<SessionOutputEnvelope>,
-        mpsc::Receiver<BulkOutputCommand>,
+        mpsc::UnboundedReceiver<BulkOutputCommand>,
     ) {
         let (control_tx, control_rx) = mpsc::channel(SESSION_OUTPUT_ITEM_CAPACITY);
         let (bulk_tx, bulk_rx) = mpsc::channel(SESSION_BULK_OUTPUT_ITEM_CAPACITY);
-        let (bulk_command_tx, bulk_command_rx) = mpsc::channel(SESSION_BULK_COMMAND_CAPACITY);
+        let (bulk_command_tx, bulk_command_rx) = mpsc::unbounded_channel();
         (
             Self {
                 generation: 0,
@@ -490,7 +491,6 @@ impl SessionOutputSender {
         let (completion, completed) = oneshot::channel();
         commands
             .send(BulkOutputCommand::Park { completion })
-            .await
             .map_err(|_| "bulk scheduler closed while parking")?;
         completed.await.map_err(|_| "bulk output park failed")
     }
@@ -502,7 +502,6 @@ impl SessionOutputSender {
         let (completion, completed) = oneshot::channel();
         commands
             .send(BulkOutputCommand::Resume { completion })
-            .await
             .map_err(|_| "bulk scheduler closed while resuming")?;
         completed.await.map_err(|_| "bulk output resume failed")
     }
@@ -521,7 +520,6 @@ impl SessionOutputSender {
                     generation: self.generation,
                     completion,
                 })
-                .await
                 .map_err(|_| "bulk scheduler closed during restore")?;
             completed
                 .await
@@ -548,12 +546,12 @@ impl SessionOutputSender {
         };
         let (completion, completed) = oneshot::channel();
         commands
-            .try_send(BulkOutputCommand::DropFlow {
+            .send(BulkOutputCommand::DropFlow {
                 incarnation,
                 id,
                 completion,
             })
-            .map_err(|_| "dedicated bulk scheduler command queue is unavailable")?;
+            .map_err(|_| "dedicated bulk scheduler has exited")?;
         Ok(Some(completed))
     }
 
@@ -567,11 +565,11 @@ impl SessionOutputSender {
         };
         let (completion, completed) = oneshot::channel();
         commands
-            .try_send(BulkOutputCommand::DropIncarnation {
+            .send(BulkOutputCommand::DropIncarnation {
                 incarnation,
                 completion,
             })
-            .map_err(|_| "dedicated bulk scheduler command queue is unavailable")?;
+            .map_err(|_| "dedicated bulk scheduler has exited")?;
         Ok(Some(completed))
     }
 

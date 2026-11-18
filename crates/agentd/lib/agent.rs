@@ -1207,7 +1207,7 @@ pub async fn run(
 fn spawn_bulk_writer_task(
     writer_file: File,
     output_rx: tokio::sync::mpsc::Receiver<SessionOutputEnvelope>,
-    command_rx: tokio::sync::mpsc::Receiver<BulkOutputCommand>,
+    command_rx: tokio::sync::mpsc::UnboundedReceiver<BulkOutputCommand>,
 ) -> (
     tokio::sync::mpsc::Receiver<String>,
     tokio::sync::mpsc::Receiver<RawActivity>,
@@ -1260,7 +1260,7 @@ async fn recv_optional<T>(receiver: &mut Option<tokio::sync::mpsc::Receiver<T>>)
 async fn bulk_writer_task(
     file: File,
     mut output_rx: tokio::sync::mpsc::Receiver<SessionOutputEnvelope>,
-    mut command_rx: tokio::sync::mpsc::Receiver<BulkOutputCommand>,
+    mut command_rx: tokio::sync::mpsc::UnboundedReceiver<BulkOutputCommand>,
     activity_tx: tokio::sync::mpsc::Sender<RawActivity>,
 ) -> AgentdResult<()> {
     // SAFETY: File keeps the descriptor open and unchanged until AsyncFd drops it.
@@ -5491,6 +5491,105 @@ mod tests {
             .0
         );
         assert_eq!(client_incarnation_for_id(&state, id_start), Some(new));
+    }
+
+    #[tokio::test]
+    async fn disconnect_after_hundreds_of_flow_purges_keeps_the_agent_loop() {
+        // A relay client that dies with hundreds of forwarded connections open has each flow
+        // cancelled in one synchronous stretch of the agent loop, before the bulk scheduler task
+        // runs. The range cleanup that follows must still be queued: when it was refused, the
+        // agent loop exited and the VM stopped (Windows relay repro, `Vmm is stopping`).
+        let id_start = 1;
+        let id_end_exclusive = microsandbox_protocol::AGENT_RELAY_ID_RANGE_STEP;
+        let incarnation = [0x44; CLIENT_INCARNATION_SIZE];
+        let mut state = AgentState::default();
+        establish_relay_client(
+            &mut state,
+            RelayClientConnected {
+                id_start,
+                id_end_exclusive,
+                incarnation,
+            },
+        )
+        .unwrap();
+        let (session_tx, _control, _bulk, mut commands) = SessionOutputSender::split_channel();
+        let flows = 600;
+        for id in id_start..id_start + flows {
+            cancel_bulk_correlation(id, BulkKind::Tcp, &mut state, &session_tx);
+        }
+
+        let (removed, cleanup) = disconnect_relay_client(
+            &mut state,
+            RelayClientDisconnected {
+                id_start,
+                id_end_exclusive,
+                incarnation: Some(incarnation),
+            },
+            &session_tx,
+        )
+        .unwrap();
+
+        assert!(removed);
+        assert!(cleanup.is_some());
+        let mut dropped_flows = Vec::new();
+        for _ in 0..flows {
+            match commands.try_recv().unwrap() {
+                BulkOutputCommand::DropFlow {
+                    incarnation: owner,
+                    id,
+                    ..
+                } => {
+                    assert_eq!(owner, incarnation);
+                    dropped_flows.push(id);
+                }
+                _ => panic!("expected a flow purge"),
+            }
+        }
+        assert_eq!(
+            dropped_flows,
+            (id_start..id_start + flows).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            BulkOutputCommand::DropIncarnation { incarnation: owner, .. } if owner == incarnation
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn range_cleanup_fails_once_the_bulk_scheduler_is_gone() {
+        let id_start = 1;
+        let id_end_exclusive = microsandbox_protocol::AGENT_RELAY_ID_RANGE_STEP;
+        let incarnation = [0x45; CLIENT_INCARNATION_SIZE];
+        let mut state = AgentState::default();
+        establish_relay_client(
+            &mut state,
+            RelayClientConnected {
+                id_start,
+                id_end_exclusive,
+                incarnation,
+            },
+        )
+        .unwrap();
+        let (session_tx, _control, _bulk, commands) = SessionOutputSender::split_channel();
+        drop(commands);
+
+        let error = disconnect_relay_client(
+            &mut state,
+            RelayClientDisconnected {
+                id_start,
+                id_end_exclusive,
+                incarnation: Some(incarnation),
+            },
+            &session_tx,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("dedicated bulk scheduler has exited")
+        );
     }
 
     #[test]
