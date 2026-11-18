@@ -50,6 +50,10 @@ pub struct ExecOptions {
 
     /// Resource limits applied before exec via `setrlimit()`.
     pub rlimits: Vec<Rlimit>,
+
+    /// Most bytes a buffered exec keeps of each of stdout and stderr; the rest is read and
+    /// dropped. `None` keeps everything. Streaming sessions ignore it.
+    pub max_output: Option<usize>,
 }
 
 /// Builder for [`ExecOptions`].
@@ -83,6 +87,12 @@ pub struct ExecOutput {
 
     /// Captured stderr.
     stderr: Bytes,
+
+    /// Whether stdout had more bytes than the cap in [`ExecOptions::max_output`].
+    stdout_truncated: bool,
+
+    /// Whether stderr had more bytes than the cap in [`ExecOptions::max_output`].
+    stderr_truncated: bool,
 }
 
 /// Process exit status.
@@ -263,6 +273,14 @@ impl ExecOptionsBuilder {
         self
     }
 
+    /// Keep at most `bytes` of each of stdout and stderr in a buffered exec. The rest is read
+    /// from the guest and dropped, so a chatty command still ends, and the output says it was
+    /// cut (see [`ExecOutput::stdout_truncated`]). Default: no cap.
+    pub fn max_output(mut self, bytes: usize) -> Self {
+        self.options.max_output = Some(bytes);
+        self
+    }
+
     /// Set a resource limit (soft = hard).
     pub fn rlimit(mut self, resource: RlimitResource, limit: u64) -> Self {
         self.options.rlimits.push(Rlimit {
@@ -290,6 +308,13 @@ impl ExecOptionsBuilder {
         validate_rlimits(&self.options.rlimits)?;
         Ok(self.options)
     }
+}
+
+/// Appends `data` to `buffer` up to `cap` bytes in all; returns whether anything was dropped.
+fn append_capped(buffer: &mut Vec<u8>, data: &[u8], cap: usize) -> bool {
+    let room = cap.saturating_sub(buffer.len());
+    buffer.extend_from_slice(&data[..room.min(data.len())]);
+    data.len() > room
 }
 
 /// Validates that every rlimit has `soft <= hard`.
@@ -331,6 +356,16 @@ impl ExecOutput {
     /// Get stderr as raw bytes.
     pub fn stderr_bytes(&self) -> &Bytes {
         &self.stderr
+    }
+
+    /// Whether stdout was cut at [`ExecOptions::max_output`].
+    pub fn stdout_truncated(&self) -> bool {
+        self.stdout_truncated
+    }
+
+    /// Whether stderr was cut at [`ExecOptions::max_output`].
+    pub fn stderr_truncated(&self) -> bool {
+        self.stderr_truncated
     }
 }
 
@@ -423,6 +458,18 @@ impl ExecHandle {
     ///
     /// Uses the same timeout and termination-confirmation behavior as [`Self::wait`].
     pub async fn collect(&mut self) -> MicrosandboxResult<ExecOutput> {
+        self.collect_capped(None).await
+    }
+
+    /// Like [`Self::collect`], keeping at most `cap` bytes of each stream. Output past the cap
+    /// is still received (the guest never waits on a full buffer) and dropped.
+    pub(crate) async fn collect_capped(
+        &mut self,
+        cap: Option<usize>,
+    ) -> MicrosandboxResult<ExecOutput> {
+        let cap = cap.unwrap_or(usize::MAX);
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut exit_code: Option<i32> = None;
@@ -431,10 +478,10 @@ impl ExecHandle {
             match event {
                 ExecEvent::Started { pid: _ } => {}
                 ExecEvent::Stdout(data) => {
-                    stdout.extend_from_slice(&data);
+                    stdout_truncated |= append_capped(&mut stdout, &data, cap);
                 }
                 ExecEvent::Stderr(data) => {
-                    stderr.extend_from_slice(&data);
+                    stderr_truncated |= append_capped(&mut stderr, &data, cap);
                 }
                 ExecEvent::Exited { code } => {
                     self.check_timeout()?;
@@ -457,6 +504,8 @@ impl ExecHandle {
             },
             stdout: Bytes::from(stdout),
             stderr: Bytes::from(stderr),
+            stdout_truncated,
+            stderr_truncated,
         })
     }
 
@@ -686,6 +735,7 @@ pub(crate) mod agent {
             tty,
             stdin: stdin_mode,
             timeout,
+            max_output: _,
         } = opts;
 
         // Validate before dispatch. Count execution time from request dispatch, but never
@@ -771,20 +821,24 @@ pub(crate) mod agent {
         // Buffered exec keeps its existing deadline and error contract. Do not start a
         // second timer in its underlying streaming session.
         let timeout_duration = opts.timeout.take();
+        let cap = opts.max_output;
         let mut handle = exec_stream(backend, name, config, cmd, opts).await?;
 
         match timeout_duration {
-            Some(duration) => match tokio::time::timeout(duration, handle.collect()).await {
+            Some(duration) => match tokio::time::timeout(duration, handle.collect_capped(cap)).await {
                 Ok(result) => result,
                 Err(_) => {
                     let _ = handle.kill().await;
                     let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(5), handle.collect())
-                            .await;
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle.collect_capped(cap),
+                        )
+                        .await;
                     Err(MicrosandboxError::ExecTimeout(duration))
                 }
             },
-            None => handle.collect().await,
+            None => handle.collect_capped(cap).await,
         }
     }
 
@@ -1021,10 +1075,23 @@ pub(crate) mod agent {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        use super::super::append_capped;
         use super::*;
         use microsandbox_protocol::{codec, core::Ready, message::PROTOCOL_VERSION};
 
         const TEST_INPUT_LIMIT: u32 = 64 * 1024;
+
+        #[test]
+        fn append_capped_keeps_the_head_and_says_when_it_dropped_something() {
+            let mut buffer = Vec::new();
+            assert!(!append_capped(&mut buffer, b"abc", 5));
+            assert!(append_capped(&mut buffer, b"defg", 5));
+            assert_eq!(buffer, b"abcde");
+            assert!(append_capped(&mut buffer, b"h", 5));
+            assert_eq!(buffer, b"abcde");
+            let mut exact = Vec::new();
+            assert!(!append_capped(&mut exact, b"abcde", 5));
+        }
 
         async fn flow_test_client() -> (Arc<AgentClient>, tokio::io::DuplexStream) {
             flow_test_client_with_version(PROTOCOL_VERSION).await
